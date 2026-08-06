@@ -1,0 +1,26 @@
+# Ignore shell script backups and temp files
+*~
+*.swp
+*.swo
+# Ignore OS files
+.DS_Store
+Thumbs.db
+# Ignore shell history
+.history
+# Ignore editors and IDE files
+.vscode/
+.idea/
+# Ignore generated files
+*.log
+*.tmp
+*.bak
+# Ignore Python caches if any
+__pycache__/
+*.py[cod]
+# Ignore package manager folders
+node_modules/
+# Ignore compiled database artifacts
+*.dmp
+*.sqlldr
+# Ignore environment files
+.env

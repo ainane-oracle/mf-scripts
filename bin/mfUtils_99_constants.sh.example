@@ -1,0 +1,156 @@
+utils_VERSION=1.8
+#
+# -----------------------------------------------------------------------------
+#
+#  Generation marker   : MF_DOC_REUSED
+#  File                : mfUtils_99_constants.sh
+#
+#  Purpose             : . This script contains constant variables mainly
+#                        depending on the installation environment.. All
+#                        hard-coded values must be inserted here.. When
+#                        installing the migration factory, this script is
+#                        created with default values if it does not exists...
+#                        Once modified, it should not be overwritten anymore by
+#                        further installations
+#
+#  Description         : .
+#
+#  Functions           : 
+#                        - None
+#
+#  Change History      : 
+#                        - 02/09/2024 MBO 4 variables to force same password for OGG users on databases
+#                        - (MF_SRC_OGGPDB_PW_UNIQUE,MF_SRC_OGGCDB_PW_UNIQUE
+#                        - ,MF_TGT_OGGPDB_PW_UNIQUE, MF_TGT_OGGCDB_PW_UNIQUE)
+#                        - 15/11/2024 MBO - Version 1.2.5, before LOT-0 start,
+#                        - [ "$MF_BIN" = "" ] && export MF_BIN=$MF_BIN
+#                        - export NLS_LANG=american_america.utf8
+#                        - export MF_PREREQ_AUTOMATION_LEVEL=1 # Level of pre-requisites management automation
+#                        - 0: Basic
+#
+# *****************************************************************************
+
+[ "$MF_BIN" = "" ] && export MF_BIN=$MF_BIN
+export NLS_LANG=american_america.utf8
+
+export MF_AUTO_REMOVE_ABANDONNED=${MF_AUTO_REMOVE_ABANDONNED:-N}                       # OGG Dependencies automatically removes abandonned targets
+export MF_AUTO_REMOVE_ABANDONNED_PRD=${MF_AUTO_REMOVE_ABANDONNED_PRD:-N}               # OGG Dependencies automatically removes abandonned PRD and PPR targets
+export MF_PREREQ_AUTOMATION_LEVEL=1                                                    # Level of pre-requisites management automation
+                                                                                       #    0 : Basic
+                                                                                       #    1 : - Ignore DBA_USERS
+                                                                                       #        - Make EVAL fail if source pre-requisites are not successful
+export MF_SYSTEM_LOCKS=$MF_HOME/data/systemLocks                                       # Gloval LOCK Files of the MF
+export MF_PR_CHECK_ONLY_FAILED=Y                                                       # Check only FAILED pre-requisites (unless -p ALL is used )
+export MF_PR_RECHECK_AFTER=7                                                           # Reckect if last successfull check older than N Days
+export MF_ENV_TYPE=PROD                                                                # Production environment for the migration factory (Controsl getRelease.sh behavior)
+export MF_CNX_CHK_REPO=12                                                              # Number of hours between 2 checks of the repository connection
+export MF_CNX_CHK_SRC=2                                                                # Number of hours between 2 checks of the Source DB connection
+export MF_CNX_CHK_TGT=2                                                                # Number of hours between 2 checks of the Target DB connection
+
+export MF_PASSWORD_STORE=KEEPASS                                                       # Passwords are stored in KEEPASS
+export MF_PASSWORDS=/u01/.mfPasswords                                                  # Hidden folder for the database
+export MF_PASSWORD_KEYS=/u01/.mfPwKeys                                                 # Hidden folder for the key
+export MF_PW_DATABASE=$MF_PASSWORDS/MF_PW_DB.kdbx                                      # Database file
+export MF_PW_KEY=$MF_PASSWORD_KEYS/MF_PW_DB.keyx                                       # Key FILE
+export MF_CONNECT_STRING_TYPE=${MF_CONNECT_STRING_TYPE:-TNS}                           # Type of connect string to use EZCONNECT, TNS
+export MF_SRC_DG_CNX=${MF_SRC_DG_CNX:-Y}                                               # Generate DATAGUARD connect strings for SOURCE
+export MF_TGT_DG_CNX=${MF_TGT_DG_CNX:-Y}                                               # Generate DATAGUARD connect strings for TARGET
+export MF_TGT_DB_UNIQUE=${MF_TGT_DB_UNIQUE:-N}                                         # DB Unique names are unique across servers (password identification does not include server name if 'Y')
+export MF_SRC_DB_UNIQUE=${MF_SRC_DB_UNIQUE:-N}                                         # DB Unique names are unique across servers (password identification does not include server name if 'Y')
+#
+#   Set to 'Y' when we use the same password on all databases 
+#
+export MF_SRC_PW_UNIQUE=Y                                   # Source password for migration user is the same on all databases
+export MF_SRC_OGGPDB_PW_UNIQUE=Y
+export MF_SRC_OGGCDB_PW_UNIQUE=Y
+export MF_TGT_OGGPDB_PW_UNIQUE=N
+export MF_TGT_OGGCDB_PW_UNIQUE=N
+
+export MF_TGT_TYPE="EXACC"                                  # Default target TYPE (EXACC,EXADATA,DBSYSTEM)
+export MF_SUDOER="opc"                                      # USER who can sudo to oracle,grid and root
+
+#export MF_OGG_DEPLOYMENT_NAME=OGG1_DEPL1                    # Name of the OGG deployment in the container
+
+#MF_OGG_LOCAL_DEPLOYMENT_NAME="$(mfOGG_ListLocalDeployments | head -1)"
+#if [ -z "$MF_OGG_LOCAL_DEPLOYMENT_NAME" ]; then
+#MF_OGG_DEPLOYMENT_NAME="$MF_OGG_LOCAL_DEPLOYMENT_NAME"
+#fi
+
+export MF_OGGUSER_AUTOCREATE=N                              # mfCheckPrerequisites.sh will create the OGGADMIN user on databases (requires sys password)
+export MF_TGT_SYS_AVAILABLE=N                               # SYS user available for migration at target
+
+export MF_REPO_DBA_USER=system                              # Name of the DBA account in the repository database
+export MF_REPO_SYS_USER=sys                                 # Name of the SYSBA account in the repository
+export MF_TNS="//localhost:1521/MFREF"                      # TNS of the repository
+export MF_APEX_ADMIN_MAIL="migration.factory@acme.com"      # Email for APEX setup (fake email)
+export MF_REPO_USER=${MFAUTO_REPO_USER}                     # By default MF_REPO_USER is not set, when ran from the repository
+                                                            # MFAUTO_REPO_USER is set, we copy it here (MFAUTO_REPO_USER is not saved in the env file 
+                                                            # For direct executon
+export LANG=en_US                                           # We want to speak english here !!!!!!
+export MF_CONST_MAX_BLOCKED_WAIT=240                        # Max seconds the ZDMWatchDOG waits before aborting the job when blocked
+if [ "$LOG_QUIET" = "" ]
+then
+  export LOG_QUIET=Y                                        # If 'Y' print only important LOG information
+fi
+
+export  ORACLE_MAINTAINED_USERS="'SYS' ,'AUDSYS' ,'SYSTEM' ,'OUTLN' ,'GSMADMIN_INTERNAL' ,'GSMUSER' ,'DIP' ,'REMOTE_SCHEDULER_AGENT' ,'DBSFWUSER' ,'ORACLE_OCM'\
+,'SYS\$UMF' ,'DBSNMP' ,'APPQOSSYS' ,'GSMCATUSER' ,'GGSYS' ,'XDB' ,'ANONYMOUS' ,'WMSYS' ,'OJVMSYS' ,'CTXSYS' , 'OCOR_OWN'\
+,'ORDSYS' ,'ORDDATA' ,'ORDPLUGINS' ,'SI_INFORMTN_SCHEMA' ,'MDSYS' ,'OLAPSYS' ,'MDDATA' ,'LBACSYS' ,'DVF' ,'FLOWS_FILES' ,'APEX_230200'\
+,'APEX_PUBLIC_USER' ,'APEX_LISTENER' ,'APEX_REST_PUBLIC_USER' ,'DVSYS' ,'SYSBACKUP' ,'SYSDG' ,'SYSKM' ,'SYSRAC' ,'XS\$NULL','MIG_EXACC','C##MIG_EXACC','C__MIG_EXACC'"
+
+#
+#  Marketplace related
+#
+MK_IDP_URL="https://orchestrator-idp.group.echonet"
+MK_GW_URL="https://orchestrator-gw.group.echonet"
+
+
+#
+#       I running with a repository, we set the connect string
+# 
+if [ "$MF_REPO_USER" != "" ]
+then
+  pass_repo=$(getSecretPassword MF_DB_USER ${MF_REPO_USER^^}_$(hostname -s)) || die "$pass_repo"
+  MF_REPO_CONNECT="${MF_REPO_USER}/${pass_repo}@$MF_TNS"
+fi
+
+# ----------------------------------------------------------------------------------------------------------------------------------------
+#
+#    The below variables are used in the scripts, they can be 
+#  set in the environment to change some behaviour (for testing for example)
+#
+# ----------------------------------------------------------------------------------------------------------------------------------------
+
+[ "$MF_LOG_COMMANDS" = "" ] && export MF_LOG_COMMANDS=N       # Controls the generation of the file logging all exec_sql calls --> Y|N
+[ "$MF_DEBUG" = "" ]        && export MF_DEBUG=N              # Controls additionnal DEBUG messages                            --> Y|N
+[ "$MF_BYPASS_LOCK" = "" ]  && export MF_BYPASS_LOCK=N        # Allow a script to run even if an attemp is locked              --> Y|N
+[ "$MF_BYPASS_MLS" = "" ]   && export MF_BYPASS_MLS=N         # Allow a script to run even if MILESTONE control is not O       --> Y|N
+
+# OEM 13.5 REST configuration used only by mfEmBlackout.sh -A START.
+# Supply the password from the protected deployment environment or secret store;
+# never write it in this constants file, an attempt env file, or a response file.
+export MF_OEM_API_BASE_URL=${MF_OEM_API_BASE_URL:-}                         # HTTPS origin, for example https://oms.example:7803
+export MF_OEM_API_USERNAME=${MF_OEM_API_USERNAME:-}                         # OEM user with target-read and blackout-create privileges
+# MF_OEM_API_PASSWORD must be injected at runtime and is intentionally not defaulted here.
+export MF_OEM_BLACKOUT_REASON_ID=${MF_OEM_BLACKOUT_REASON_ID:-29}
+export MF_OEM_BLACKOUT_ALLOW_JOBS=${MF_OEM_BLACKOUT_ALLOW_JOBS:-true}       # true|false
+export MF_OEM_START_VERIFY_ATTEMPTS=${MF_OEM_START_VERIFY_ATTEMPTS:-12}
+export MF_OEM_START_VERIFY_INTERVAL=${MF_OEM_START_VERIFY_INTERVAL:-5}       # Seconds between START_PROCESSING checks
+export MF_OEM_CA_CERT=${MF_OEM_CA_CERT:-}                                   # Optional PEM CA bundle; TLS verification is never disabled
+export MF_OEM_BLACKOUT_STATE_DIR=${MF_OEM_BLACKOUT_STATE_DIR:-}             # Defaults to $MF_DATA/em_blackouts
+export MF_OEM_PRIMARY_CDB_NAME=${MF_OEM_PRIMARY_CDB_NAME:-}                 # Exact OEM CDB target name; defaults to the script-derived CDB_NAME
+export MF_OEM_REQUIRED_CDB_NAMES=${MF_OEM_REQUIRED_CDB_NAMES:-}             # Exact comma/space-separated OEM CDB names; required when peers exist
+
+ 
+if [ -f $MF_BIN/mfSpecificFunctions.BNP.sh ]
+then
+  # echo "Run functions"
+  . $MF_BIN/mfSpecificFunctions.BNP.sh
+fi
+#
+#    Must end in success
+#
+true
+
+
+
