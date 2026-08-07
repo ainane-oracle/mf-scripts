@@ -1548,8 +1548,8 @@ SELECT value FROM v\$spparameter WHERE name = '$p';")
     if ! $MF_BIN/mfEmBlackout.sh -m $MF_MIGRATION_ID -A IS_ON -n </dev/null >/dev/null 2>&1
     then
       echo "No Blackout"
-      libAction "Start Blackout until planned go-live + 12 hours (12-hour fallback)" "$I2"
-      if $MF_BIN/mfEmBlackout.sh -m $MF_MIGRATION_ID -A START -n </dev/null >/dev/null 2>&1
+      libAction "Start Blackout (00:30), until : $(date -d "now + 30 minutes")"  "$I2"
+      if $MF_BIN/mfEmBlackout.sh -m $MF_MIGRATION_ID -A START -d "00:30" -n </dev/null >/dev/null 2>&1
       then
         echo Ok
       else

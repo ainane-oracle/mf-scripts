@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# OEM REST support for mfEmBlackout.sh START.  This file only defines functions.
+# OEM REST support for every mfEmBlackout.sh action selected with -r.
 # Authentication is passed to curl over stdin so the password is never present in
 # the process command line, logs, response files, or temporary files.
 
@@ -28,8 +28,8 @@ mf_oem_validate_config()
   MF_OEM_API_BASE_URL=${MF_OEM_API_BASE_URL%/}
   MF_OEM_BLACKOUT_REASON_ID=${MF_OEM_BLACKOUT_REASON_ID:-29}
   MF_OEM_BLACKOUT_ALLOW_JOBS=${MF_OEM_BLACKOUT_ALLOW_JOBS:-true}
-  MF_OEM_START_VERIFY_ATTEMPTS=${MF_OEM_START_VERIFY_ATTEMPTS:-12}
-  MF_OEM_START_VERIFY_INTERVAL=${MF_OEM_START_VERIFY_INTERVAL:-5}
+  MF_OEM_VERIFY_ATTEMPTS=${MF_OEM_VERIFY_ATTEMPTS:-${MF_OEM_START_VERIFY_ATTEMPTS:-12}}
+  MF_OEM_VERIFY_INTERVAL=${MF_OEM_VERIFY_INTERVAL:-${MF_OEM_START_VERIFY_INTERVAL:-5}}
 
   [[ "$MF_OEM_BLACKOUT_REASON_ID" =~ ^[0-9]+$ ]] \
     || mf_oem_error "MF_OEM_BLACKOUT_REASON_ID must be a non-negative integer" || return 1
@@ -37,14 +37,14 @@ mf_oem_validate_config()
     true|false) : ;;
     *) mf_oem_error "MF_OEM_BLACKOUT_ALLOW_JOBS must be true or false"; return 1 ;;
   esac
-  [[ "$MF_OEM_START_VERIFY_ATTEMPTS" =~ ^[1-9][0-9]*$ ]] \
-    || mf_oem_error "MF_OEM_START_VERIFY_ATTEMPTS must be a positive integer" || return 1
-  [[ "$MF_OEM_START_VERIFY_INTERVAL" =~ ^[0-9]+$ ]] \
-    || mf_oem_error "MF_OEM_START_VERIFY_INTERVAL must be a non-negative integer" || return 1
+  [[ "$MF_OEM_VERIFY_ATTEMPTS" =~ ^[1-9][0-9]*$ ]] \
+    || mf_oem_error "MF_OEM_VERIFY_ATTEMPTS must be a positive integer" || return 1
+  [[ "$MF_OEM_VERIFY_INTERVAL" =~ ^[0-9]+$ ]] \
+    || mf_oem_error "MF_OEM_VERIFY_INTERVAL must be a non-negative integer" || return 1
 
   MF_OEM_BLACKOUT_REASON_ID=$((10#$MF_OEM_BLACKOUT_REASON_ID))
-  MF_OEM_START_VERIFY_ATTEMPTS=$((10#$MF_OEM_START_VERIFY_ATTEMPTS))
-  MF_OEM_START_VERIFY_INTERVAL=$((10#$MF_OEM_START_VERIFY_INTERVAL))
+  MF_OEM_VERIFY_ATTEMPTS=$((10#$MF_OEM_VERIFY_ATTEMPTS))
+  MF_OEM_VERIFY_INTERVAL=$((10#$MF_OEM_VERIFY_INTERVAL))
 
   if [ -n "${MF_OEM_CA_CERT:-}" ] && [ ! -r "$MF_OEM_CA_CERT" ]
   then
@@ -130,6 +130,28 @@ mf_oem_validate_collection_page()
   ' "$file" >/dev/null 2>&1 || mf_oem_error "Malformed OEM target collection response"
 }
 
+mf_oem_validate_blackout_collection_page()
+{
+  local file="$1"
+  jq -e '
+    type == "object" and
+    (.count | type == "number") and
+    (.items | type == "array") and
+    (.links | type == "object") and
+    (.count == (.items | length)) and
+    ((.links.next == null) or
+      (.links.next | type == "object" and (.href | type == "string" and length > 0))) and
+    (.items | all(
+      type == "object" and
+      (.id | type == "string" and length > 0) and
+      (.name | type == "string" and length > 0) and
+      (.status | type == "string" and length > 0) and
+      (.type | type == "string" and length > 0) and
+      (.owner | type == "string" and length > 0)
+    ))
+  ' "$file" >/dev/null 2>&1 || mf_oem_error "Malformed OEM blackout collection response"
+}
+
 mf_oem_same_origin_next_url()
 {
   local href="$1"
@@ -211,6 +233,89 @@ mf_oem_fetch_target_pages()
       url=
     fi
   done
+}
+
+mf_oem_fetch_blackout_pages()
+{
+  local first_url="$1"
+  local output_file="$2"
+  local allowed_path="/em/api/blackouts"
+  local url="$first_url"
+  local page_file next_href next_url merged_file
+  local pages=0
+  local seen='|'
+
+  printf '[]\n' > "$output_file" || return 1
+  while [ -n "$url" ]
+  do
+    pages=$((pages + 1))
+    [ "$pages" -le 100 ] || mf_oem_error "OEM blackout pagination exceeded 100 pages" || return 1
+    case "$seen" in
+      *"|$url|"*) mf_oem_error "OEM blackout pagination cycle detected"; return 1 ;;
+    esac
+    seen="${seen}${url}|"
+
+    mf_oem_new_temp_file page_file || return 1
+    mf_oem_http GET "$url" "$page_file" || return 1
+    mf_oem_expect_http "$MF_OEM_HTTP_STATUS" 200 "Blackout lookup" || return 1
+    mf_oem_validate_blackout_collection_page "$page_file" || return 1
+
+    mf_oem_new_temp_file merged_file || return 1
+    jq --slurpfile page "$page_file" '. + $page[0].items' "$output_file" > "$merged_file" \
+      || mf_oem_error "Unable to merge OEM blackout results" || return 1
+    mv -f -- "$merged_file" "$output_file" || return 1
+
+    next_href=$(jq -er '.links.next.href // empty' "$page_file" 2>/dev/null) || next_href=
+    if [ -n "$next_href" ]
+    then
+      next_url=$(mf_oem_same_origin_next_url "$next_href" "$allowed_path") || return 1
+      url="$next_url"
+    else
+      url=
+    fi
+  done
+}
+
+mf_oem_select_active_blackout()
+{
+  local blackouts_file="$1"
+  local blackout_name="$2"
+  local output_file="$3"
+  local selected_file count
+
+  mf_oem_new_temp_file selected_file || return 1
+  jq --arg name "$blackout_name" '
+    [ .[] |
+      select(.name == $name) |
+      select(.status as $status | [
+        "SCHEDULED", "START_PROCESSING", "START_PARTIAL", "STARTED",
+        "STOP_PENDING", "STOP_FAILED", "STOP_PARTIAL",
+        "EDIT_PENDING", "EDIT_FAILED", "EDIT_PARTIAL", "END_PARTIAL"
+      ] | index($status) != null)
+    ] | unique_by(.id)
+  ' "$blackouts_file" > "$selected_file" \
+    || mf_oem_error "Unable to select the active OEM blackout" || return 1
+
+  count=$(jq 'length' "$selected_file") || return 1
+  case "$count" in
+    0) return 3 ;;
+    1) jq '.[0]' "$selected_file" > "$output_file" || return 1 ;;
+    *) mf_oem_error "More than one active OEM blackout has the exact name $blackout_name"; return 1 ;;
+  esac
+}
+
+mf_oem_find_active_blackout()
+{
+  local migration_id="$1"
+  local output_file="$2"
+  local blackout_name="MF_${migration_id}"
+  local encoded url blackouts_file
+
+  encoded=$(printf '%s' "$blackout_name" | mf_oem_urlencode) || return 1
+  url="${MF_OEM_API_BASE_URL}/em/api/blackouts?limit=2000&sort=id%3AASC&name=${encoded}"
+  mf_oem_new_temp_file blackouts_file || return 1
+  mf_oem_fetch_blackout_pages "$url" "$blackouts_file" || return 1
+  mf_oem_select_active_blackout "$blackouts_file" "$blackout_name" "$output_file"
 }
 
 mf_oem_append_json_array()
@@ -360,6 +465,62 @@ mf_oem_status_result()
   esac
 }
 
+mf_oem_stop_status_result()
+{
+  case "$1" in
+    STOPPED|ENDED) return 0 ;;
+    SCHEDULED|START_PROCESSING|STARTED|STOP_PENDING) return 2 ;;
+    START_PARTIAL|STOP_FAILED|STOP_PARTIAL|END_PARTIAL)
+      mf_oem_error "OEM blackout returned terminal stop status $1"
+      ;;
+    *) mf_oem_error "OEM blackout returned unexpected stop status $1" ;;
+  esac
+}
+
+mf_oem_get_blackout()
+{
+  local blackout_id="$1"
+  local response_file="$2"
+  mf_oem_http GET "${MF_OEM_API_BASE_URL}/em/api/blackouts/${blackout_id}" "$response_file" || return 1
+  mf_oem_expect_http "$MF_OEM_HTTP_STATUS" 200 "Blackout status" || return 1
+  mf_oem_validate_blackout_response "$response_file"
+}
+
+mf_oem_print_blackout()
+{
+  local response_file="$1"
+  jq -r '
+    "OEM blackout ID       : \(.id)",
+    "OEM blackout name     : \(.name)",
+    "OEM blackout status   : \(.status)",
+    (if (.timeToEnd // .creationTimeToEnd // "") != ""
+     then "OEM blackout end time : \(.timeToEnd // .creationTimeToEnd)"
+     else empty end)
+  ' "$response_file" || mf_oem_error "Unable to format OEM blackout status"
+}
+
+mf_oem_wait_for_stopped()
+{
+  local blackout_id="$1"
+  local response_file="$2"
+  local attempt=1
+  local status rc
+
+  while [ "$attempt" -le "$MF_OEM_VERIFY_ATTEMPTS" ]
+  do
+    mf_oem_get_blackout "$blackout_id" "$response_file" || return 1
+    status=$(jq -r '.status' "$response_file") || return 1
+    mf_oem_stop_status_result "$status"
+    rc=$?
+    [ "$rc" -eq 0 ] && return 0
+    [ "$rc" -eq 2 ] || return 1
+    [ "$attempt" -lt "$MF_OEM_VERIFY_ATTEMPTS" ] || break
+    sleep "$MF_OEM_VERIFY_INTERVAL"
+    attempt=$((attempt + 1))
+  done
+  mf_oem_error "OEM blackout did not reach STOPPED within the verification window"
+}
+
 mf_oem_prepare_state_file()
 {
   local migration_id="$1"
@@ -416,15 +577,15 @@ mf_oem_wait_for_started()
   local attempt=1
   local status rc
 
-  while [ "$attempt" -le "$MF_OEM_START_VERIFY_ATTEMPTS" ]
+  while [ "$attempt" -le "$MF_OEM_VERIFY_ATTEMPTS" ]
   do
     status=$(jq -r '.status' "$response_file") || return 1
     mf_oem_status_result "$status"
     rc=$?
     [ "$rc" -eq 0 ] && return 0
     [ "$rc" -eq 2 ] || return 1
-    [ "$attempt" -lt "$MF_OEM_START_VERIFY_ATTEMPTS" ] || break
-    sleep "$MF_OEM_START_VERIFY_INTERVAL"
+    [ "$attempt" -lt "$MF_OEM_VERIFY_ATTEMPTS" ] || break
+    sleep "$MF_OEM_VERIFY_INTERVAL"
     mf_oem_http GET "${MF_OEM_API_BASE_URL}/em/api/blackouts/${blackout_id}" "$response_file" || return 1
     mf_oem_expect_http "$MF_OEM_HTTP_STATUS" 200 "Blackout status verification" || return 1
     mf_oem_validate_blackout_response "$response_file" || return 1
@@ -456,10 +617,23 @@ mf_oem_start_blackout()
   local peer_count="$3"
   local time_to_end="$4"
   local required_file targets_file payload_file response_file blackout_id
+  local active_file active_rc active_status
 
   umask 077
   MF_OEM_TMP_FILES=()
   mf_oem_validate_config || return 1
+  mf_oem_new_temp_file active_file || return 1
+  mf_oem_find_active_blackout "$migration_id" "$active_file"
+  active_rc=$?
+  case "$active_rc" in
+    0)
+      active_status=$(jq -r '.status' "$active_file") || return 1
+      mf_oem_error "An OEM blackout named MF_${migration_id} is already active with status $active_status"
+      return 1
+      ;;
+    3) : ;;
+    *) return 1 ;;
+  esac
   mf_oem_prepare_state_file "$migration_id" || return 1
   mf_oem_new_temp_file required_file || return 1
   mf_oem_new_temp_file targets_file || return 1
@@ -497,4 +671,96 @@ mf_oem_start_blackout()
   fi
   printf 'Resolved target count : %s\n' "$(jq 'length' "$targets_file")"
   printf 'Protected state file  : %s\n' "$MF_OEM_BLACKOUT_STATE_FILE"
+}
+
+mf_oem_status_blackout()
+{
+  local migration_id="$1"
+  local active_file response_file blackout_id rc
+
+  umask 077
+  MF_OEM_TMP_FILES=()
+  mf_oem_validate_config || return 1
+  mf_oem_new_temp_file active_file || return 1
+  mf_oem_find_active_blackout "$migration_id" "$active_file"
+  rc=$?
+  case "$rc" in
+    0) : ;;
+    3) printf 'OEM blackout MF_%s: NOT ACTIVE\n' "$migration_id"; return 0 ;;
+    *) return 1 ;;
+  esac
+
+  blackout_id=$(jq -r '.id' "$active_file") || return 1
+  [[ "$blackout_id" =~ ^[A-Za-z0-9._-]+$ ]] \
+    || mf_oem_error "OEM returned an unsafe blackout ID" || return 1
+  mf_oem_new_temp_file response_file || return 1
+  mf_oem_get_blackout "$blackout_id" "$response_file" || return 1
+  mf_oem_print_blackout "$response_file"
+}
+
+mf_oem_is_blackout_on()
+{
+  local migration_id="$1"
+  local active_file response_file blackout_id status rc
+
+  umask 077
+  MF_OEM_TMP_FILES=()
+  mf_oem_validate_config || return 1
+  mf_oem_new_temp_file active_file || return 1
+  mf_oem_find_active_blackout "$migration_id" "$active_file"
+  rc=$?
+  case "$rc" in
+    0) : ;;
+    3) printf 'OEM blackout MF_%s: NOT ACTIVE\n' "$migration_id"; return 1 ;;
+    *) return 1 ;;
+  esac
+
+  blackout_id=$(jq -r '.id' "$active_file") || return 1
+  [[ "$blackout_id" =~ ^[A-Za-z0-9._-]+$ ]] \
+    || mf_oem_error "OEM returned an unsafe blackout ID" || return 1
+  mf_oem_new_temp_file response_file || return 1
+  mf_oem_get_blackout "$blackout_id" "$response_file" || return 1
+  status=$(jq -r '.status' "$response_file") || return 1
+  if [ "$status" = "STARTED" ]
+  then
+    printf 'OEM blackout MF_%s is ON\n' "$migration_id"
+    return 0
+  fi
+  printf 'OEM blackout MF_%s is not fully ON (status: %s)\n' "$migration_id" "$status"
+  return 1
+}
+
+mf_oem_stop_blackout()
+{
+  local migration_id="$1"
+  local active_file response_file stop_file blackout_id status rc
+
+  umask 077
+  MF_OEM_TMP_FILES=()
+  mf_oem_validate_config || return 1
+  mf_oem_new_temp_file active_file || return 1
+  mf_oem_find_active_blackout "$migration_id" "$active_file"
+  rc=$?
+  case "$rc" in
+    0) : ;;
+    3) mf_oem_error "No active OEM blackout named MF_${migration_id} was found"; return 1 ;;
+    *) return 1 ;;
+  esac
+
+  blackout_id=$(jq -r '.id' "$active_file") || return 1
+  [[ "$blackout_id" =~ ^[A-Za-z0-9._-]+$ ]] \
+    || mf_oem_error "OEM returned an unsafe blackout ID" || return 1
+  mf_oem_new_temp_file response_file || return 1
+  mf_oem_get_blackout "$blackout_id" "$response_file" || return 1
+  status=$(jq -r '.status' "$response_file") || return 1
+
+  if [ "$status" != "STOP_PENDING" ]
+  then
+    mf_oem_new_temp_file stop_file || return 1
+    mf_oem_http POST "${MF_OEM_API_BASE_URL}/em/api/blackouts/${blackout_id}/actions/stop" "$stop_file" || return 1
+    mf_oem_expect_http "$MF_OEM_HTTP_STATUS" 204 "Blackout stop" || return 1
+  fi
+
+  mf_oem_wait_for_stopped "$blackout_id" "$response_file" || return 1
+  mf_oem_print_blackout "$response_file"
 }

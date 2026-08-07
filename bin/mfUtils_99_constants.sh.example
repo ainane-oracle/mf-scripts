@@ -126,16 +126,16 @@ fi
 [ "$MF_BYPASS_LOCK" = "" ]  && export MF_BYPASS_LOCK=N        # Allow a script to run even if an attemp is locked              --> Y|N
 [ "$MF_BYPASS_MLS" = "" ]   && export MF_BYPASS_MLS=N         # Allow a script to run even if MILESTONE control is not O       --> Y|N
 
-# OEM 13.5 REST configuration used only by mfEmBlackout.sh -A START.
-# Supply the password from the protected deployment environment or secret store;
-# never write it in this constants file, an attempt env file, or a response file.
+# OEM 13.5 REST configuration used by mfEmBlackout.sh only when -r is supplied.
+# Temporary deployment model: set username and password here in plain text.
+# Replace this with protected secret retrieval in the planned security update.
 export MF_OEM_API_BASE_URL=${MF_OEM_API_BASE_URL:-}                         # HTTPS origin, for example https://oms.example:7803
-export MF_OEM_API_USERNAME=${MF_OEM_API_USERNAME:-}                         # OEM user with target-read and blackout-create privileges
-# MF_OEM_API_PASSWORD must be injected at runtime and is intentionally not defaulted here.
+export MF_OEM_API_USERNAME=${MF_OEM_API_USERNAME:-}                         # Plain-text OEM username placeholder
+export MF_OEM_API_PASSWORD=${MF_OEM_API_PASSWORD:-}                         # Plain-text OEM password placeholder
 export MF_OEM_BLACKOUT_REASON_ID=${MF_OEM_BLACKOUT_REASON_ID:-29}
 export MF_OEM_BLACKOUT_ALLOW_JOBS=${MF_OEM_BLACKOUT_ALLOW_JOBS:-true}       # true|false
-export MF_OEM_START_VERIFY_ATTEMPTS=${MF_OEM_START_VERIFY_ATTEMPTS:-12}
-export MF_OEM_START_VERIFY_INTERVAL=${MF_OEM_START_VERIFY_INTERVAL:-5}       # Seconds between START_PROCESSING checks
+export MF_OEM_VERIFY_ATTEMPTS=${MF_OEM_VERIFY_ATTEMPTS:-12}
+export MF_OEM_VERIFY_INTERVAL=${MF_OEM_VERIFY_INTERVAL:-5}                   # Seconds between asynchronous action checks
 export MF_OEM_CA_CERT=${MF_OEM_CA_CERT:-}                                   # Optional PEM CA bundle; TLS verification is never disabled
 export MF_OEM_BLACKOUT_STATE_DIR=${MF_OEM_BLACKOUT_STATE_DIR:-}             # Defaults to $MF_DATA/em_blackouts
 export MF_OEM_PRIMARY_CDB_NAME=${MF_OEM_PRIMARY_CDB_NAME:-}                 # Exact OEM CDB target name; defaults to the script-derived CDB_NAME

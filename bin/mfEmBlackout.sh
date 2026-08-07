@@ -15,7 +15,7 @@
 #
 # *****************************************************************************
 
-VERSION=1.11
+VERSION=1.12
 # ************************************************************************** 
 # Modifications :
 # =============
@@ -30,6 +30,8 @@ VERSION=1.11
 #                  go-live time plus twelve hours.
 # 06/08/2026     - Version 1.11, use a twelve-hour duration when no current
 #                  planned go-live exists and default to STATUS.
+# 07/08/2026     - Version 1.12, preserve local emctl behavior by default and
+#                  add opt-in OEM REST handling for every action with -r.
 #
 # ************************************************************************** 
 SCRIPT_LIB="Migration Factory 2.0 : Manage EM blackouts for a target database"
@@ -257,12 +259,15 @@ Required:
 
 Options:
   -A action              : Operation to execute [DEFAULT: STATUS] - START : Creates the.
-                             blackout until planned go-live plus 12 hours, or.
-                             for 12 hours when no current go-live is planned.
+                             blackout. With -r, it ends at planned go-live plus.
+                             12 hours, or lasts 12 hours when no go-live is planned.
                              (monitoring alerts are not raised) - STOP : Removes the.
                              blackout (monitoring alerts will resume) - STATUS : Show the.
                              status of the blackout - IS_ON : returns 0 if Blackout is ON.
-  -d duration            : Deprecated compatibility option; ignored by START.
+  -d duration            : Legacy START duration, format [D] HH:MI [DEFAULT: 12h].
+                             Ignored when -r is used.
+  -r                     : Use the centralized OEM REST API for the selected action.
+                             Without -r, all actions retain local emctl behavior.
   -Q                     : Quiet mode (remove progress output).
   -V                     : Print all logging information.
   -n                     : Disable log output.
@@ -271,7 +276,9 @@ Options:
 
 Examples:
   $(basename "$0") -m MIGRATION_ID
-$(basename "$0") -m MIGRATION_ID -A action
+  $(basename "$0") -m MIGRATION_ID -A START -d 02:00
+  $(basename "$0") -m MIGRATION_ID -r -A START
+  $(basename "$0") -m MIGRATION_ID -r -A STATUS
 
 Notes:
   Use --help to display the detailed usage section when available.
@@ -341,13 +348,15 @@ touch $TMPFILE
   ACTION=STATUS
   DURATION="12:00"
   DURATION_EXPLICIT=N
+  USE_REST_API=N
   toShift=0
-  while getopts :m:A:d:QVnh opt
+  while getopts :m:A:d:rQVnh opt
   do
     case $opt in
      # --------- Script parameters ---------------------------------------------
      A) ACTION=${OPTARG^^}                            ; toShift=$(($toShift + 2)) ;;
      d) DURATION=${OPTARG^^} ; DURATION_EXPLICIT=Y   ; toShift=$(($toShift + 2)) ;;
+     r) USE_REST_API=Y                                ; toShift=$(($toShift + 1)) ;;
      # --------- Common parameters ---------------------------------------------
      Q) setVar LOG_QUIET                  Y           ; toShift=$(($toShift + 1)) ;;
      V) setVar LOG_QUIET                  N           ; toShift=$(($toShift + 1)) ;;
@@ -451,74 +460,89 @@ touch $TMPFILE
 
   ERR=0
   
-  if [ "$ACTION" = "START" ]
+  if [ "$USE_REST_API" = "Y" ]
   then
-    # TARGET_CLUSTERS identifies peer clusters, but not the peer database's OEM
-    # target name. Count peers in both relationship directions and require exact
-    # names through MF_OEM_REQUIRED_CDB_NAMES whenever a peer exists.
-    PEER_COUNT=$(exec_sql "$MF_REPO_CONNECT" "
-                                      with attempt_cluster as
-                                      (
-                                        select prj_name, tclu_id
-                                        from migration_attempts
-                                        where mig_id = $MFAUTO_MIG_ID
-                                      ), peers as
-                                      (
-                                        select tc.peer_tclu_id peer_tclu_id
-                                        from target_clusters tc
-                                        join attempt_cluster ac
-                                          on ac.prj_name = tc.prj_name
-                                         and ac.tclu_id = tc.tclu_id
-                                        where tc.peer_tclu_id is not null
-                                        union
-                                        select tc.tclu_id peer_tclu_id
-                                        from target_clusters tc
-                                        join attempt_cluster ac
-                                          on ac.prj_name = tc.prj_name
-                                         and tc.peer_tclu_id = ac.tclu_id
-                                      )
-                                      select to_char(count(distinct peer_tclu_id))
-                                      from peers;")
-    PEER_COUNT=$(echo "${PEER_COUNT:-0}" | tr -d '[:space:]')
-    [[ "$PEER_COUNT" =~ ^[0-9]+$ ]] || die "Unable to determine target peer topology"
-
-    [ "$DURATION_EXPLICIT" = "N" ] \
-      || infoAction "Ignoring deprecated -d; blackout end is planned go-live + 12 hours" "$I1"
-
-    if ! TIME_TO_END=$(exec_sql "$MF_REPO_CONNECT" "
-                                      select to_char(
-                                               sys_extract_utc(
-                                                 from_tz(cast(po.target_date as timestamp), sessiontimezone)
-                                               ) + interval '12' hour,
-                                               'YYYY-MM-DD\"T\"HH24:MI\"Z\"'
-                                             )
-                                      from migration_planned_operations po
-                                      where po.mig_id = $MFAUTO_MIG_ID
-                                        and po.mls_id = mf_mig_parameters.get_id('MLS_ID_GOLIVE_START', po.prj_name)
-                                        and po.current_plan = 'Y';")
-    then
-      die "Unable to query the current planned go-live time"
-    fi
-    TIME_TO_END=$(printf '%s\n' "$TIME_TO_END" \
-      | sed -e '/^[[:space:]]*$/d' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
-    if [ -z "$TIME_TO_END" ]
-    then
-      infoAction "No current planned go-live; using a 12-hour OEM blackout duration" "$I1"
-    else
-      mf_oem_validate_time_to_end "$TIME_TO_END" \
-        || die "Unable to determine one valid current planned go-live time for timeToEnd"
-      infoAction "OEM blackout timeToEnd (planned go-live + 12 hours): $TIME_TO_END" "$I1"
-    fi
-
     trap mf_oem_cleanup EXIT
-    PRIMARY_OEM_CDB_NAME=${MF_OEM_PRIMARY_CDB_NAME:-$CDB_NAME}
-    mf_oem_start_blackout "$MF_MIGRATION_ID" "$PRIMARY_OEM_CDB_NAME" "$PEER_COUNT" "$TIME_TO_END" \
-      || die "Unable to create and verify the centralized OEM REST blackout"
+    case "$ACTION" in
+      START)
+        # TARGET_CLUSTERS identifies peer clusters, but not the peer database's
+        # OEM target name. Exact primary/standby names remain deployment input.
+        PEER_COUNT=$(exec_sql "$MF_REPO_CONNECT" "
+                                          with attempt_cluster as
+                                          (
+                                            select prj_name, tclu_id
+                                            from migration_attempts
+                                            where mig_id = $MFAUTO_MIG_ID
+                                          ), peers as
+                                          (
+                                            select tc.peer_tclu_id peer_tclu_id
+                                            from target_clusters tc
+                                            join attempt_cluster ac
+                                              on ac.prj_name = tc.prj_name
+                                             and ac.tclu_id = tc.tclu_id
+                                            where tc.peer_tclu_id is not null
+                                            union
+                                            select tc.tclu_id peer_tclu_id
+                                            from target_clusters tc
+                                            join attempt_cluster ac
+                                              on ac.prj_name = tc.prj_name
+                                             and tc.peer_tclu_id = ac.tclu_id
+                                          )
+                                          select to_char(count(distinct peer_tclu_id))
+                                          from peers;")
+        PEER_COUNT=$(echo "${PEER_COUNT:-0}" | tr -d '[:space:]')
+        [[ "$PEER_COUNT" =~ ^[0-9]+$ ]] || die "Unable to determine target peer topology"
+
+        [ "$DURATION_EXPLICIT" = "N" ] \
+          || infoAction "Ignoring -d in REST mode; REST scheduling uses planned go-live or the 12-hour fallback" "$I1"
+
+        if ! TIME_TO_END=$(exec_sql "$MF_REPO_CONNECT" "
+                                          select to_char(
+                                                   sys_extract_utc(
+                                                     from_tz(cast(po.target_date as timestamp), sessiontimezone)
+                                                   ) + interval '12' hour,
+                                                   'YYYY-MM-DD\"T\"HH24:MI\"Z\"'
+                                                 )
+                                          from migration_planned_operations po
+                                          where po.mig_id = $MFAUTO_MIG_ID
+                                            and po.mls_id = mf_mig_parameters.get_id('MLS_ID_GOLIVE_START', po.prj_name)
+                                            and po.current_plan = 'Y';")
+        then
+          die "Unable to query the current planned go-live time"
+        fi
+        TIME_TO_END=$(printf '%s\n' "$TIME_TO_END" \
+          | sed -e '/^[[:space:]]*$/d' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+        if [ -z "$TIME_TO_END" ]
+        then
+          infoAction "No current planned go-live; using a 12-hour OEM blackout duration" "$I1"
+        else
+          mf_oem_validate_time_to_end "$TIME_TO_END" \
+            || die "Unable to determine one valid current planned go-live time for timeToEnd"
+          infoAction "OEM blackout timeToEnd (planned go-live + 12 hours): $TIME_TO_END" "$I1"
+        fi
+
+        PRIMARY_OEM_CDB_NAME=${MF_OEM_PRIMARY_CDB_NAME:-$CDB_NAME}
+        mf_oem_start_blackout "$MF_MIGRATION_ID" "$PRIMARY_OEM_CDB_NAME" "$PEER_COUNT" "$TIME_TO_END" \
+          || die "Unable to create and verify the centralized OEM REST blackout"
+        ;;
+      STATUS)
+        mf_oem_status_blackout "$MF_MIGRATION_ID" \
+          || die "Unable to retrieve centralized OEM REST blackout status"
+        ;;
+      IS_ON)
+        mf_oem_is_blackout_on "$MF_MIGRATION_ID" \
+          || die "Centralized OEM REST blackout is not fully active"
+        ;;
+      STOP)
+        mf_oem_stop_blackout "$MF_MIGRATION_ID" \
+          || die "Unable to stop and verify the centralized OEM REST blackout"
+        ;;
+    esac
     mf_oem_cleanup
     trap - EXIT
   else
-    # Compatibility path: STATUS, IS_ON, and STOP intentionally retain their
-    # existing local-agent emctl behavior and blackout naming.
+    # Default compatibility path: every action retains its original local-agent
+    # emctl behavior and blackout naming unless -r is supplied.
     for node in $(exec_sql "$MF_REPO_CONNECT" "
                                                 SELECT
                                                   tn.fqdn  
@@ -543,6 +567,12 @@ touch $TMPFILE
     echo
     
     case $ACTION in
+      START)  exec_on_target -verbose "${MF_SUDOER:-opc}@$node" "oracle" "$EMCTL config agent listtargets | grep $CDB_NAME | grep oracle_database"
+              targets=$(exec_on_target -tty "${MF_SUDOER:-opc}@$node" "oracle" "$EMCTL config agent listtargets" | grep $CDB_NAME | grep oracle_database | sed -e "s;\[;;" -e "s;\];;" -e "s; *, *;:;" | cut -f1 -d":" |tr '\n' ' ')
+              infoAction "Blacked out = $targets" "$I2"
+              exec_on_target -verbose "${MF_SUDOER:-opc}@$node" "oracle" "$EMCTL start blackout MF_2_${CDB_NAME}_Migration \$(echo \"$targets\") -d $DURATION" \
+                                     "Create Migration factory blackout for $CDB_NAME" "$I2"
+             ;;
       STATUS) exec_on_target -verbose "${MF_SUDOER:-opc}@$node" "oracle" "$EMCTL status blackout | awk 'BEGIN {pr=0} /${CDB_NAME}_Migration/ {pr=1 ; printf(\"* * * * * * * * * * * * * * * * * * %s * * * * * * * * * * * * * * * * * *\n\",\$0) ; next} /Expired/ {if (pr==1) {print} ; pr=0 ; next } {if (pr==1) print}'" \
                                      "Status of Migration Factory blackout for $CDB_NAME" "$I2"      
              ;;

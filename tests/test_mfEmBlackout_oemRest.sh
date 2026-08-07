@@ -11,6 +11,7 @@ UNSTABLE_MAIN_SCRIPT="$RELEASE_ROOT/unstable_bin/mfEmBlackout.sh"
 
 TEST_TMP=$(mktemp -d)
 trap 'rm -rf -- "$TEST_TMP"' EXIT
+MF_TMP="$TEST_TMP"
 PASS=0
 FAIL=0
 
@@ -38,6 +39,16 @@ expect_failure()
   local name="$1"
   shift
   if "$@" >/dev/null 2>&1; then fail "$name"; else pass "$name"; fi
+}
+
+expect_return()
+{
+  local name="$1"
+  local expected="$2"
+  shift 2
+  "$@" >/dev/null 2>&1
+  local actual=$?
+  if [ "$actual" -eq "$expected" ]; then pass "$name"; else fail "$name"; fi
 }
 
 write_json()
@@ -114,6 +125,9 @@ expect_success "HTTP 201 is accepted for POST" mf_oem_expect_http 201 201 "test 
 expect_success "STARTED is success" mf_oem_status_result STARTED
 expect_failure "START_PARTIAL is failure" mf_oem_status_result START_PARTIAL
 expect_failure "START_FAILED is failure" mf_oem_status_result START_FAILED
+expect_success "STOPPED is a completed stop" mf_oem_stop_status_result STOPPED
+expect_return "STOP_PENDING remains in progress" 2 mf_oem_stop_status_result STOP_PENDING
+expect_failure "STOP_PARTIAL is a failed stop" mf_oem_stop_status_result STOP_PARTIAL
 
 write_json "$TEST_TMP/payload-targets.json" '[
   {"id":"cdb-a","name":"CDBA","typeName":"oracle_database","requiredCdb":"CDBA"},
@@ -172,6 +186,39 @@ else
   fail "STATUS is the default action in bin and unstable_bin"
 fi
 
+write_json "$TEST_TMP/blackout-page.json" '{
+  "count": 1,
+  "items": [{"id":"B-1","name":"MF_MIG-42","status":"STARTED","type":"PATCHING","owner":"mf-user"}],
+  "links": {}
+}'
+expect_success "valid blackout collection is accepted" mf_oem_validate_blackout_collection_page "$TEST_TMP/blackout-page.json"
+
+write_json "$TEST_TMP/blackouts.json" '[
+  {"id":"B-OLD","name":"MF_MIG-42","status":"ENDED","type":"PATCHING","owner":"mf-user"},
+  {"id":"B-1","name":"MF_MIG-42","status":"STARTED","type":"PATCHING","owner":"mf-user"}
+]'
+MF_OEM_TMP_FILES=()
+if mf_oem_select_active_blackout "$TEST_TMP/blackouts.json" 'MF_MIG-42' "$TEST_TMP/selected-blackout.json" \
+   && jq -e '.id == "B-1" and .status == "STARTED"' "$TEST_TMP/selected-blackout.json" >/dev/null
+then
+  pass "one active REST blackout is selected while ended history is ignored"
+else
+  fail "one active REST blackout is selected while ended history is ignored"
+fi
+
+write_json "$TEST_TMP/no-active-blackouts.json" '[
+  {"id":"B-OLD","name":"MF_MIG-42","status":"ENDED","type":"PATCHING","owner":"mf-user"}
+]'
+expect_return "no active REST blackout is distinct from a lookup error" 3 \
+  mf_oem_select_active_blackout "$TEST_TMP/no-active-blackouts.json" 'MF_MIG-42' "$TEST_TMP/no-active.json"
+
+write_json "$TEST_TMP/ambiguous-blackouts.json" '[
+  {"id":"B-1","name":"MF_MIG-42","status":"STARTED","type":"PATCHING","owner":"mf-user"},
+  {"id":"B-2","name":"MF_MIG-42","status":"STOP_PENDING","type":"PATCHING","owner":"mf-user"}
+]'
+expect_failure "multiple active REST blackouts fail closed" \
+  mf_oem_select_active_blackout "$TEST_TMP/ambiguous-blackouts.json" 'MF_MIG-42' "$TEST_TMP/ambiguous.json"
+
 write_json "$TEST_TMP/state-required.json" '["CDBA"]'
 write_json "$TEST_TMP/state-response.json" '{"id":"BLACKOUT-1","name":"MF_MIG-42","status":"STARTED"}'
 MF_DATA="$TEST_TMP/data"
@@ -201,16 +248,45 @@ else
   pass "configuration errors redact secrets"
 fi
 
-start_block=$(awk '
-  /if \[ "\$ACTION" = "START" \]/{capture=1}
+rest_block=$(awk '
+  /if \[ "\$USE_REST_API" = "Y" \]/{capture=1}
   capture && /^  else$/{exit}
   capture{print}
 ' "$MAIN_SCRIPT")
-if printf '%s\n' "$start_block" | grep -E 'exec_on_target|emctl start blackout|config agent listtargets|ssh ' >/dev/null
+if printf '%s\n' "$rest_block" | grep -E 'exec_on_target|emctl start blackout|config agent listtargets|ssh ' >/dev/null
 then
-  fail "START contains no SSH or emctl execution"
+  fail "-r actions contain no SSH or emctl execution"
+elif printf '%s\n' "$rest_block" | grep -F 'mf_oem_start_blackout' >/dev/null \
+     && printf '%s\n' "$rest_block" | grep -F 'mf_oem_status_blackout' >/dev/null \
+     && printf '%s\n' "$rest_block" | grep -F 'mf_oem_is_blackout_on' >/dev/null \
+     && printf '%s\n' "$rest_block" | grep -F 'mf_oem_stop_blackout' >/dev/null
+then
+  pass "-r routes every action exclusively through OEM REST"
 else
-  pass "START contains no SSH or emctl execution"
+  fail "-r routes every action exclusively through OEM REST"
+fi
+
+legacy_block=$(awk '
+  /if \[ "\$USE_REST_API" = "Y" \]/{seen=1}
+  seen && /^  else$/{capture=1; next}
+  capture && /^  fi$/{exit}
+  capture{print}
+' "$MAIN_SCRIPT")
+if printf '%s\n' "$legacy_block" | grep -F 'emctl start blackout' >/dev/null \
+   && printf '%s\n' "$legacy_block" | grep -F 'emctl status blackout' >/dev/null \
+   && printf '%s\n' "$legacy_block" | grep -F 'emctl stop blackout' >/dev/null
+then
+  pass "without -r every action retains local emctl behavior"
+else
+  fail "without -r every action retains local emctl behavior"
+fi
+
+if grep -F 'while getopts :m:A:d:rQVnh opt' "$MAIN_SCRIPT" >/dev/null \
+   && grep -F 'r) USE_REST_API=Y' "$MAIN_SCRIPT" >/dev/null
+then
+  pass "-r is an explicit opt-in switch"
+else
+  fail "-r is an explicit opt-in switch"
 fi
 
 apex_sources=(
@@ -220,13 +296,14 @@ apex_sources=(
 )
 for apex_source in "${apex_sources[@]}"
 do
-  if grep -F "rec.code || ' -A START ,Start Blackout: go-live plus 12 hours; 12-hour fallback if not planned'" "$apex_source" >/dev/null \
-     && grep -F "Start (GL+12h / 12h fallback)</A>" "$apex_source" >/dev/null \
-     && grep -F "rec.code || ' -A STOP ,Stop Blackout'" "$apex_source" >/dev/null
+  if grep -F "rec.code || ' -A START ,Start local emctl Blackout'" "$apex_source" >/dev/null \
+     && grep -F "rec.code || ' -r -A STATUS ,OEM REST Blackout status for '" "$apex_source" >/dev/null \
+     && grep -F "rec.code || ' -r -A START ,Start OEM REST Blackout: go-live plus 12 hours; 12-hour fallback if not planned'" "$apex_source" >/dev/null \
+     && grep -F "rec.code || ' -r -A STOP ,Stop OEM REST Blackout'" "$apex_source" >/dev/null
   then
-    pass "APEX blackout links are valid and describe the START end time ($(basename "$apex_source"))"
+    pass "APEX exposes separate local and OEM REST blackout actions ($(basename "$apex_source"))"
   else
-    fail "APEX blackout links are valid and describe the START end time ($(basename "$apex_source"))"
+    fail "APEX exposes separate local and OEM REST blackout actions ($(basename "$apex_source"))"
   fi
 done
 
@@ -269,7 +346,6 @@ curl()
   printf '200'
 }
 
-MF_TMP="$TEST_TMP"
 MF_OEM_TMP_FILES=()
 MF_OEM_API_USERNAME=test-user
 MF_OEM_API_PASSWORD=test-password

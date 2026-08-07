@@ -1792,7 +1792,7 @@ end ;
             'Analyze replication slowness</A></LI>' ||
             '';
     tmp := tmp || l_url ;
-    tmp := tmp || '<LI> Blackout : ' ;
+    tmp := tmp || '<LI> Blackout (local emctl) : ' ;
     l_url := '<A href="' || APEX_UTIL.PREPARE_URL(p_url => 'f?p='|| p_app_id || ':3700:' || p_session || '::NO:'||
                                                             ':P3700_COMMAND,P3700_TITLE' ||  ':' ||
                                                             '$MF_BIN/mfEmBlackout.sh -m ' || rec.code || ' -A STATUS ,Blackout status for ' || rec.code
@@ -1804,7 +1804,35 @@ end ;
           tmp := tmp || chr(amp) || 'nbsp;' || '-' ||chr(amp) || 'nbsp;';
     l_url := '<A href="' || APEX_UTIL.PREPARE_URL(p_url => 'f?p='|| p_app_id || ':3700:' || p_session || '::NO:'||
                                                             ':P3700_COMMAND,P3700_TITLE' ||  ':' ||
-                                                            '$MF_BIN/mfEmBlackout.sh -m ' || rec.code || ' -A START ,Start Blackout: go-live plus 12 hours; 12-hour fallback if not planned'
+                                                            '$MF_BIN/mfEmBlackout.sh -m ' || rec.code || ' -A START ,Start local emctl Blackout'
+                                                ,p_checksum_type => 'SESSION') || '">' ||
+            'Start</A>' ||
+            '';
+    tmp := tmp || l_url ;
+
+          tmp := tmp || chr(amp) || 'nbsp;' || '-' ||chr(amp) || 'nbsp;';
+    l_url := '<A href="' || APEX_UTIL.PREPARE_URL(p_url => 'f?p='|| p_app_id || ':3700:' || p_session || '::NO:'||
+                                                            ':P3700_COMMAND,P3700_TITLE' ||  ':' ||
+                                                            '$MF_BIN/mfEmBlackout.sh -m ' || rec.code || ' -A STOP ,Stop Blackout'
+                                                ,p_checksum_type => 'SESSION') || '">' ||
+            'Stop</A>' ||
+            '';
+    tmp := tmp || l_url ;
+
+    tmp := tmp || '</LI>' ;
+    tmp := tmp || '<LI> Blackout (OEM REST) : ' ;
+    l_url := '<A href="' || APEX_UTIL.PREPARE_URL(p_url => 'f?p='|| p_app_id || ':3700:' || p_session || '::NO:'||
+                                                            ':P3700_COMMAND,P3700_TITLE' ||  ':' ||
+                                                            '$MF_BIN/mfEmBlackout.sh -m ' || rec.code || ' -r -A STATUS ,OEM REST Blackout status for ' || rec.code
+                                                ,p_checksum_type => 'SESSION') || '">' ||
+            'Status</A>' ||
+            '';
+    tmp := tmp || l_url ;
+
+          tmp := tmp || chr(amp) || 'nbsp;' || '-' ||chr(amp) || 'nbsp;';
+    l_url := '<A href="' || APEX_UTIL.PREPARE_URL(p_url => 'f?p='|| p_app_id || ':3700:' || p_session || '::NO:'||
+                                                            ':P3700_COMMAND,P3700_TITLE' ||  ':' ||
+                                                            '$MF_BIN/mfEmBlackout.sh -m ' || rec.code || ' -r -A START ,Start OEM REST Blackout: go-live plus 12 hours; 12-hour fallback if not planned'
                                                 ,p_checksum_type => 'SESSION') || '">' ||
             'Start (GL+12h / 12h fallback)</A>' ||
             '';
@@ -1813,7 +1841,7 @@ end ;
           tmp := tmp || chr(amp) || 'nbsp;' || '-' ||chr(amp) || 'nbsp;';
     l_url := '<A href="' || APEX_UTIL.PREPARE_URL(p_url => 'f?p='|| p_app_id || ':3700:' || p_session || '::NO:'||
                                                             ':P3700_COMMAND,P3700_TITLE' ||  ':' ||
-                                                            '$MF_BIN/mfEmBlackout.sh -m ' || rec.code || ' -A STOP ,Stop Blackout'
+                                                            '$MF_BIN/mfEmBlackout.sh -m ' || rec.code || ' -r -A STOP ,Stop OEM REST Blackout'
                                                 ,p_checksum_type => 'SESSION') || '">' ||
             'Stop</A>' ||
             '';
