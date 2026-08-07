@@ -12,6 +12,12 @@ mf_oem_error()
   return 1
 }
 
+mf_oem_blackout_name()
+{
+  local migration_id="$1"
+  printf '%s\n' "${MF_OEM_BLACKOUT_NAME:-MF_${migration_id}}"
+}
+
 mf_oem_require_command()
 {
   command -v "$1" >/dev/null 2>&1 || mf_oem_error "Required command is not available: $1"
@@ -308,8 +314,10 @@ mf_oem_find_active_blackout()
 {
   local migration_id="$1"
   local output_file="$2"
-  local blackout_name="MF_${migration_id}"
+  local blackout_name
   local encoded url blackouts_file
+
+  blackout_name=$(mf_oem_blackout_name "$migration_id") || return 1
 
   encoded=$(printf '%s' "$blackout_name" | mf_oem_urlencode) || return 1
   url="${MF_OEM_API_BASE_URL}/em/api/blackouts?limit=2000&sort=id%3AASC&name=${encoded}"
@@ -423,7 +431,7 @@ mf_oem_build_payload()
   local payload_file="$4"
   [ -z "$time_to_end" ] || mf_oem_validate_time_to_end "$time_to_end" || return 1
   jq -n \
-    --arg name "MF_${migration_id}" \
+    --arg name "$(mf_oem_blackout_name "$migration_id")" \
     --arg description "Migration Factory planned maintenance for ${migration_id}; OEM monitoring blackout during the migration window." \
     --argjson reasonId "$MF_OEM_BLACKOUT_REASON_ID" \
     --argjson allowJobs "$MF_OEM_BLACKOUT_ALLOW_JOBS" \
@@ -621,6 +629,7 @@ mf_oem_start_blackout()
 
   umask 077
   MF_OEM_TMP_FILES=()
+  MF_OEM_START_MUTATION_ATTEMPTED=N
   mf_oem_validate_config || return 1
   mf_oem_new_temp_file active_file || return 1
   mf_oem_find_active_blackout "$migration_id" "$active_file"
@@ -628,7 +637,7 @@ mf_oem_start_blackout()
   case "$active_rc" in
     0)
       active_status=$(jq -r '.status' "$active_file") || return 1
-      mf_oem_error "An OEM blackout named MF_${migration_id} is already active with status $active_status"
+      mf_oem_error "An OEM blackout named $(mf_oem_blackout_name "$migration_id") is already active with status $active_status"
       return 1
       ;;
     3) : ;;
@@ -643,6 +652,10 @@ mf_oem_start_blackout()
   mf_oem_parse_required_cdb_names "$primary_cdb" "$peer_count" "$required_file" || return 1
   mf_oem_discover_targets "$required_file" "$targets_file" || return 1
   mf_oem_build_payload "$migration_id" "$targets_file" "$time_to_end" "$payload_file" || return 1
+  # A network failure after this point is ambiguous: OEM may have created the
+  # blackout even when curl did not receive a response. The caller must not
+  # fall back to emctl in that case.
+  MF_OEM_START_MUTATION_ATTEMPTED=Y
   mf_oem_http POST "${MF_OEM_API_BASE_URL}/em/api/blackouts" "$response_file" "$payload_file" || return 1
   mf_oem_expect_http "$MF_OEM_HTTP_STATUS" 201 "Blackout creation" || return 1
   mf_oem_validate_blackout_response "$response_file" || return 1
@@ -680,13 +693,14 @@ mf_oem_status_blackout()
 
   umask 077
   MF_OEM_TMP_FILES=()
+  MF_OEM_LOOKUP_RESULT=
   mf_oem_validate_config || return 1
   mf_oem_new_temp_file active_file || return 1
   mf_oem_find_active_blackout "$migration_id" "$active_file"
   rc=$?
   case "$rc" in
     0) : ;;
-    3) printf 'OEM blackout MF_%s: NOT ACTIVE\n' "$migration_id"; return 0 ;;
+    3) MF_OEM_LOOKUP_RESULT=NOT_ACTIVE; printf 'OEM blackout %s: NOT ACTIVE\n' "$(mf_oem_blackout_name "$migration_id")"; return 0 ;;
     *) return 1 ;;
   esac
 
@@ -711,7 +725,7 @@ mf_oem_is_blackout_on()
   rc=$?
   case "$rc" in
     0) : ;;
-    3) printf 'OEM blackout MF_%s: NOT ACTIVE\n' "$migration_id"; return 1 ;;
+    3) printf 'OEM blackout %s: NOT ACTIVE\n' "$(mf_oem_blackout_name "$migration_id")"; return 1 ;;
     *) return 1 ;;
   esac
 
@@ -723,10 +737,10 @@ mf_oem_is_blackout_on()
   status=$(jq -r '.status' "$response_file") || return 1
   if [ "$status" = "STARTED" ]
   then
-    printf 'OEM blackout MF_%s is ON\n' "$migration_id"
+    printf 'OEM blackout %s is ON\n' "$(mf_oem_blackout_name "$migration_id")"
     return 0
   fi
-  printf 'OEM blackout MF_%s is not fully ON (status: %s)\n' "$migration_id" "$status"
+  printf 'OEM blackout %s is not fully ON (status: %s)\n' "$(mf_oem_blackout_name "$migration_id")" "$status"
   return 1
 }
 
@@ -737,13 +751,14 @@ mf_oem_stop_blackout()
 
   umask 077
   MF_OEM_TMP_FILES=()
+  MF_OEM_STOP_MUTATION_ATTEMPTED=N
   mf_oem_validate_config || return 1
   mf_oem_new_temp_file active_file || return 1
   mf_oem_find_active_blackout "$migration_id" "$active_file"
   rc=$?
   case "$rc" in
     0) : ;;
-    3) mf_oem_error "No active OEM blackout named MF_${migration_id} was found"; return 1 ;;
+    3) mf_oem_error "No active OEM blackout named $(mf_oem_blackout_name "$migration_id") was found"; return 1 ;;
     *) return 1 ;;
   esac
 
@@ -757,8 +772,13 @@ mf_oem_stop_blackout()
   if [ "$status" != "STOP_PENDING" ]
   then
     mf_oem_new_temp_file stop_file || return 1
+    # Once a stop request is attempted, its outcome may be unknown even if the
+    # transport fails. Do not let callers issue an unrelated local fallback.
+    MF_OEM_STOP_MUTATION_ATTEMPTED=Y
     mf_oem_http POST "${MF_OEM_API_BASE_URL}/em/api/blackouts/${blackout_id}/actions/stop" "$stop_file" || return 1
     mf_oem_expect_http "$MF_OEM_HTTP_STATUS" 204 "Blackout stop" || return 1
+  else
+    MF_OEM_STOP_MUTATION_ATTEMPTED=Y
   fi
 
   mf_oem_wait_for_stopped "$blackout_id" "$response_file" || return 1

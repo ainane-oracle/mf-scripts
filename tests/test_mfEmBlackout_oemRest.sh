@@ -178,12 +178,12 @@ else
   fail "timeToEnd is derived from current planned go-live plus 12 hours in UTC"
 fi
 
-if grep -E '^[[:space:]]*ACTION=STATUS$' "$MAIN_SCRIPT" >/dev/null \
-   && grep -E '^[[:space:]]*ACTION=STATUS$' "$UNSTABLE_MAIN_SCRIPT" >/dev/null
+if grep -E '^[[:space:]]*ACTION=START$' "$MAIN_SCRIPT" >/dev/null \
+   && grep -E '^[[:space:]]*ACTION=START$' "$UNSTABLE_MAIN_SCRIPT" >/dev/null
 then
-  pass "STATUS is the default action in bin and unstable_bin"
+  pass "START remains the compatible default action in bin and unstable_bin"
 else
-  fail "STATUS is the default action in bin and unstable_bin"
+  fail "START remains the compatible default action in bin and unstable_bin"
 fi
 
 write_json "$TEST_TMP/blackout-page.json" '{
@@ -250,25 +250,25 @@ fi
 
 rest_block=$(awk '
   /if \[ "\$USE_REST_API" = "Y" \]/{capture=1}
-  capture && /^  else$/{exit}
+  capture && /^  if \[ "\$USE_REST_API" != "Y" \]/{exit}
   capture{print}
 ' "$MAIN_SCRIPT")
 if printf '%s\n' "$rest_block" | grep -E 'exec_on_target|emctl start blackout|config agent listtargets|ssh ' >/dev/null
 then
-  fail "-r actions contain no SSH or emctl execution"
+  fail "REST path directly invokes SSH or emctl"
 elif printf '%s\n' "$rest_block" | grep -F 'mf_oem_start_blackout' >/dev/null \
      && printf '%s\n' "$rest_block" | grep -F 'mf_oem_status_blackout' >/dev/null \
      && printf '%s\n' "$rest_block" | grep -F 'mf_oem_is_blackout_on' >/dev/null \
-     && printf '%s\n' "$rest_block" | grep -F 'mf_oem_stop_blackout' >/dev/null
+     && printf '%s\n' "$rest_block" | grep -F 'mf_oem_stop_blackout' >/dev/null \
+     && printf '%s\n' "$rest_block" | grep -F 'USE_REST_API=N' >/dev/null
 then
-  pass "-r routes every action exclusively through OEM REST"
+  pass "-r uses REST first and selects local fallback only after safe failures"
 else
-  fail "-r routes every action exclusively through OEM REST"
+  fail "-r uses REST first and selects local fallback only after safe failures"
 fi
 
 legacy_block=$(awk '
-  /if \[ "\$USE_REST_API" = "Y" \]/{seen=1}
-  seen && /^  else$/{capture=1; next}
+  /if \[ "\$USE_REST_API" != "Y" \]/{capture=1; next}
   capture && /^  fi$/{exit}
   capture{print}
 ' "$MAIN_SCRIPT")
@@ -279,6 +279,15 @@ then
   pass "without -r every action retains local emctl behavior"
 else
   fail "without -r every action retains local emctl behavior"
+fi
+
+if grep -F '. "$SCRIPT_DIR/mfEmBlackout_oemRest.sh"' "$MAIN_SCRIPT" >/dev/null \
+   && ! awk '/for s in \$MF_BIN\/mfUtils_/{capture=1} capture && /startStep "Initialization"/{exit} capture{print}' "$MAIN_SCRIPT" \
+          | grep -F 'mfEmBlackout_oemRest.sh' >/dev/null
+then
+  pass "REST helper is loaded only after -r has been parsed"
+else
+  fail "REST helper is loaded only after -r has been parsed"
 fi
 
 if grep -F 'while getopts :m:A:d:rQVnh opt' "$MAIN_SCRIPT" >/dev/null \
