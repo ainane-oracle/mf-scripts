@@ -138,9 +138,6 @@ export MF_OEM_VERIFY_ATTEMPTS=${MF_OEM_VERIFY_ATTEMPTS:-12}
 export MF_OEM_VERIFY_INTERVAL=${MF_OEM_VERIFY_INTERVAL:-5}                   # Seconds between asynchronous action checks
 export MF_OEM_CA_CERT=${MF_OEM_CA_CERT:-}                                   # Optional PEM CA bundle; TLS verification is never disabled
 export MF_OEM_BLACKOUT_STATE_DIR=${MF_OEM_BLACKOUT_STATE_DIR:-}             # Defaults to $MF_DATA/em_blackouts
-export MF_OEM_PRIMARY_CDB_NAME=${MF_OEM_PRIMARY_CDB_NAME:-}                 # Exact OEM CDB target name; defaults to the script-derived CDB_NAME
-export MF_OEM_REQUIRED_CDB_NAMES=${MF_OEM_REQUIRED_CDB_NAMES:-}             # Exact comma/space-separated OEM CDB names; required when peers exist
-
  
 if [ -f $MF_BIN/mfSpecificFunctions.BNP.sh ]
 then

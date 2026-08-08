@@ -24,15 +24,15 @@ VERSION=1.13
 #                  sub processes, temporary files cleanup (mktemp with suffixes)
 #
 # 15/11/2024 MBO - Version 1.2.5, before LOT-0 start,
-# 06/08/2026     - Version 1.9, create START blackouts centrally through the
+# 06/08/2026 AIN - Version 1.9, create START blackouts centrally through the
 #                  OEM REST API and preserve the legacy non-START actions.
-# 06/08/2026     - Version 1.10, set REST timeToEnd to the current planned
+# 06/08/2026 AIN - Version 1.10, set REST timeToEnd to the current planned
 #                  go-live time plus twelve hours.
-# 06/08/2026     - Version 1.11, use a twelve-hour duration when no current
+# 06/08/2026 AIN - Version 1.11, use a twelve-hour duration when no current
 #                  planned go-live exists and default to STATUS.
-# 07/08/2026     - Version 1.12, preserve local emctl behavior by default and
+# 07/08/2026 AIN - Version 1.12, preserve local emctl behavior by default and
 #                  add opt-in OEM REST handling for every action with -r.
-# 07/08/2026     - Version 1.13, retain the compatible START default; use
+# 07/08/2026 AIN - Version 1.13, retain the compatible START default; use
 #                  REST-first/local-emctl fallback before REST mutation; and
 #                  preserve a common blackout identity across both methods.
 #
@@ -463,8 +463,9 @@ touch $TMPFILE
   echo
 
   EMCTL=/u02/app/oracle/oem/agent/agent_inst/bin/emctl
-  # Preserve the established local-agent identity across REST and emctl.
-  MF_OEM_BLACKOUT_NAME=${MF_OEM_BLACKOUT_NAME:-MF_2_${CDB_NAME}_Migration}
+  # The Migration Factory blackout identity is canonical across REST and emctl.
+  # Do not accept timestamped or caller-provided variants.
+  MF_OEM_BLACKOUT_NAME=MF_2_${CDB_NAME}_Migration
 
   startStep "$ACTION a blackout for a database ($CDB_NAME)"
 
@@ -534,29 +535,40 @@ touch $TMPFILE
         ;;
       STATUS)
         MF_OEM_LOOKUP_RESULT=
-        if ! mf_oem_status_blackout "$MF_MIGRATION_ID" || [ "${MF_OEM_LOOKUP_RESULT:-}" = "NOT_ACTIVE" ]
+        if ! mf_oem_status_blackout "$MF_MIGRATION_ID" "$MFAUTO_MIG_ID" "$CDB_NAME" \
+             "$TARGETCONTAINERDATABASE_CONNECTIONDETAILS_SERVICENAME"
         then
-          echo "WARNING: OEM REST status is unavailable or has no matching blackout; falling back to local emctl"
+          echo "WARNING: OEM REST STATUS workflow failed; falling back to local emctl"
           USE_REST_API=N
         fi
         ;;
       IS_ON)
-        if ! mf_oem_is_blackout_on "$MF_MIGRATION_ID"
-        then
-          echo "WARNING: OEM REST IS_ON could not confirm the blackout; falling back to local emctl"
-          USE_REST_API=N
-        fi
+        mf_oem_is_blackout_on "$MF_MIGRATION_ID" "$MFAUTO_MIG_ID" "$CDB_NAME" \
+          "$TARGETCONTAINERDATABASE_CONNECTIONDETAILS_SERVICENAME"
+        REST_RC=$?
+        case "$REST_RC" in
+          0) : ;;
+          3) die "Canonical OEM REST blackout coverage is incomplete or not active" ;;
+          *) echo "WARNING: OEM REST IS_ON workflow failed; falling back to local emctl"; USE_REST_API=N ;;
+        esac
         ;;
       STOP)
-        if ! mf_oem_stop_blackout "$MF_MIGRATION_ID"
-        then
-          if [ "${MF_OEM_STOP_MUTATION_ATTEMPTED:-N}" = "Y" ]
-          then
-            die "Centralized OEM REST stop outcome is uncertain or incomplete; local fallback is unsafe"
-          fi
-          echo "WARNING: OEM REST STOP could not be completed; falling back to local emctl"
-          USE_REST_API=N
-        fi
+        mf_oem_stop_blackout "$MF_MIGRATION_ID" "$MFAUTO_MIG_ID" "$CDB_NAME" \
+          "$TARGETCONTAINERDATABASE_CONNECTIONDETAILS_SERVICENAME"
+        REST_RC=$?
+        case "$REST_RC" in
+          0) : ;;
+          3) die "No complete canonical OEM REST blackout is active" ;;
+          4) die "More than one complete canonical OEM REST blackout is active" ;;
+          *)
+            if [ "${MF_OEM_STOP_MUTATION_ATTEMPTED:-N}" = "Y" ]
+            then
+              die "Centralized OEM REST stop outcome is uncertain or incomplete; local fallback is unsafe"
+            fi
+            echo "WARNING: OEM REST STOP workflow failed; falling back to local emctl"
+            USE_REST_API=N
+            ;;
+        esac
         ;;
     esac
     mf_oem_cleanup

@@ -72,45 +72,71 @@ validate_fixture()
 }
 
 expect_success "one CDB and multiple PDBs" validate_fixture \
-  '["CDBA"]' \
+  '{
+    "cdbName":"CDBA","targetContainerService":"CDBA_M1","startClusterId":"1",
+    "clusters":[{"clusterId":"1","peerClusterId":null,"realName":"exa1"}],
+    "dbUniqueNames":["CDBA_M1"]
+  }' \
   '[
-    {"id":"cdb-a","name":"CDBA","typeName":"oracle_database","requiredCdb":"CDBA"},
-    {"id":"pdb-a1","name":"PDB1_CDBA","typeName":"oracle_pdb","requiredCdb":"CDBA"},
-    {"id":"pdb-a2","name":"PDB2_CDBA","typeName":"oracle_pdb","requiredCdb":"CDBA"}
+    {"id":"cdb-a","name":"exa1_CDBA_M1","typeName":"oracle_database","member":{"clusterId":"1","realName":"exa1","dbUniqueName":"CDBA_M1","targetPrefix":"exa1_CDBA_M1","discoveryMode":"target_prefix"}},
+    {"id":"pdb-a1","name":"exa1_CDBA_M1_PDB1","typeName":"oracle_pdb","member":{"clusterId":"1","realName":"exa1","dbUniqueName":"CDBA_M1","targetPrefix":"exa1_CDBA_M1","discoveryMode":"target_prefix"}},
+    {"id":"pdb-a2","name":"exa1_CDBA_M1_PDB2","typeName":"oracle_pdb","member":{"clusterId":"1","realName":"exa1","dbUniqueName":"CDBA_M1","targetPrefix":"exa1_CDBA_M1","discoveryMode":"target_prefix"}}
   ]' success_one
 
-expect_success "primary plus standby discovery" validate_fixture \
-  '["CDBA_PRIM","CDBA_STBY"]' \
+expect_success "primary plus multiple standby discovery" validate_fixture \
+  '{
+    "cdbName":"CDBA","targetContainerService":"CDBA_M1","startClusterId":"1",
+    "clusters":[
+      {"clusterId":"1","peerClusterId":null,"realName":"exa1"},
+      {"clusterId":"2","peerClusterId":"1","realName":"exa2"},
+      {"clusterId":"3","peerClusterId":"1","realName":"exa3"}
+    ],
+    "dbUniqueNames":["CDBA_M1","CDBA_M2","CDBA_M3"]
+  }' \
   '[
-    {"id":"cdb-p","name":"CDBA_PRIM","typeName":"oracle_database","requiredCdb":"CDBA_PRIM"},
-    {"id":"pdb-p","name":"APP_CDBA_PRIM","typeName":"oracle_pdb","requiredCdb":"CDBA_PRIM"},
-    {"id":"cdb-s","name":"CDBA_STBY","typeName":"oracle_database","requiredCdb":"CDBA_STBY"},
-    {"id":"pdb-s","name":"APP_CDBA_STBY","typeName":"oracle_pdb","requiredCdb":"CDBA_STBY"}
+    {"id":"cdb-1","name":"exa1_CDBA_M1","typeName":"oracle_database","member":{"clusterId":"1","realName":"exa1","dbUniqueName":"CDBA_M1","targetPrefix":"exa1_CDBA_M1","discoveryMode":"target_prefix"}},
+    {"id":"pdb-1","name":"exa1_CDBA_M1_APP","typeName":"oracle_pdb","member":{"clusterId":"1","realName":"exa1","dbUniqueName":"CDBA_M1","targetPrefix":"exa1_CDBA_M1","discoveryMode":"target_prefix"}},
+    {"id":"cdb-2","name":"exa2_CDBA_M2","typeName":"oracle_database","member":{"clusterId":"2","realName":"exa2","dbUniqueName":"CDBA_M2","targetPrefix":"exa2_CDBA_M2","discoveryMode":"target_prefix"}},
+    {"id":"pdb-2","name":"exa2_CDBA_M2_APP","typeName":"oracle_pdb","member":{"clusterId":"2","realName":"exa2","dbUniqueName":"CDBA_M2","targetPrefix":"exa2_CDBA_M2","discoveryMode":"target_prefix"}},
+    {"id":"cdb-3","name":"exa3_CDBA_M3","typeName":"oracle_database","member":{"clusterId":"3","realName":"exa3","dbUniqueName":"CDBA_M3","targetPrefix":"exa3_CDBA_M3","discoveryMode":"cdb_name_fallback"}},
+    {"id":"pdb-3","name":"exa3_CDBA_M3_APP","typeName":"oracle_pdb","member":{"clusterId":"3","realName":"exa3","dbUniqueName":"CDBA_M3","targetPrefix":"exa3_CDBA_M3","discoveryMode":"cdb_name_fallback"}}
   ]' success_peer
 
-expect_failure "zero targets fails closed" validate_fixture '["CDBA"]' '[]' zero
+one_topology='{"cdbName":"CDBA","targetContainerService":"CDBA_M1","startClusterId":"1","clusters":[{"clusterId":"1","peerClusterId":null,"realName":"exa1"}],"dbUniqueNames":["CDBA_M1"]}'
+one_member='{"clusterId":"1","realName":"exa1","dbUniqueName":"CDBA_M1","targetPrefix":"exa1_CDBA_M1","discoveryMode":"target_prefix"}'
+
+expect_failure "zero targets fails closed" validate_fixture "$one_topology" '[]' zero
+
+expect_failure "database-only discovery cannot satisfy the REST DB and PDB requirement" validate_fixture \
+  "$one_topology" \
+  '[{"id":"cdb-a","name":"exa1_CDBA_M1","typeName":"oracle_database","member":{"clusterId":"1","realName":"exa1","dbUniqueName":"CDBA_M1","targetPrefix":"exa1_CDBA_M1","discoveryMode":"target_prefix"}}]' db_only
 
 expect_failure "missing standby target fails closed" validate_fixture \
-  '["CDBA_PRIM","CDBA_STBY"]' \
-  '[{"id":"cdb-p","name":"CDBA_PRIM","typeName":"oracle_database","requiredCdb":"CDBA_PRIM"}]' missing_peer
+  '{"cdbName":"CDBA","targetContainerService":"CDBA_M1","startClusterId":"1","clusters":[{"clusterId":"1","peerClusterId":null,"realName":"exa1"},{"clusterId":"2","peerClusterId":"1","realName":"exa2"}],"dbUniqueNames":["CDBA_M1","CDBA_M2"]}' \
+  '[{"id":"cdb-p","name":"exa1_CDBA_M1","typeName":"oracle_database","member":{"clusterId":"1","realName":"exa1","dbUniqueName":"CDBA_M1","targetPrefix":"exa1_CDBA_M1","discoveryMode":"target_prefix"}}]' missing_peer
 
 expect_success "identical duplicate target IDs are deduplicated" validate_fixture \
-  '["CDBA"]' \
+  "$one_topology" \
   '[
-    {"id":"cdb-a","name":"CDBA","typeName":"oracle_database","requiredCdb":"CDBA"},
-    {"id":"cdb-a","name":"CDBA","typeName":"oracle_database","requiredCdb":"CDBA"}
+    {"id":"cdb-a","name":"exa1_CDBA_M1","typeName":"oracle_database","member":{"clusterId":"1","realName":"exa1","dbUniqueName":"CDBA_M1","targetPrefix":"exa1_CDBA_M1","discoveryMode":"target_prefix"}},
+    {"id":"cdb-a","name":"exa1_CDBA_M1","typeName":"oracle_database","member":{"clusterId":"1","realName":"exa1","dbUniqueName":"CDBA_M1","targetPrefix":"exa1_CDBA_M1","discoveryMode":"target_prefix"}},
+    {"id":"pdb-a","name":"exa1_CDBA_M1_PDB","typeName":"oracle_pdb","member":{"clusterId":"1","realName":"exa1","dbUniqueName":"CDBA_M1","targetPrefix":"exa1_CDBA_M1","discoveryMode":"target_prefix"}}
   ]' duplicate_identical
 
 expect_failure "conflicting duplicate target IDs fail closed" validate_fixture \
-  '["CDBA"]' \
+  "$one_topology" \
   '[
-    {"id":"same-id","name":"CDBA","typeName":"oracle_database","requiredCdb":"CDBA"},
-    {"id":"same-id","name":"PDB_CDBA","typeName":"oracle_pdb","requiredCdb":"CDBA"}
+    {"id":"same-id","name":"exa1_CDBA_M1","typeName":"oracle_database","member":{"clusterId":"1","realName":"exa1","dbUniqueName":"CDBA_M1","targetPrefix":"exa1_CDBA_M1","discoveryMode":"target_prefix"}},
+    {"id":"same-id","name":"exa1_CDBA_M1_PDB","typeName":"oracle_pdb","member":{"clusterId":"1","realName":"exa1","dbUniqueName":"CDBA_M1","targetPrefix":"exa1_CDBA_M1","discoveryMode":"target_prefix"}}
   ]' duplicate_conflict
 
 expect_failure "unexpected target type fails closed" validate_fixture \
-  '["CDBA"]' \
-  '[{"id":"host-a","name":"CDBA","typeName":"host","requiredCdb":"CDBA"}]' unexpected_type
+  "$one_topology" \
+  '[{"id":"host-a","name":"exa1_CDBA_M1","typeName":"host","member":{"clusterId":"1","realName":"exa1","dbUniqueName":"CDBA_M1","targetPrefix":"exa1_CDBA_M1","discoveryMode":"target_prefix"}}]' unexpected_type
+
+expect_success "consistent topology is accepted" mf_oem_validate_topology "$TEST_TMP/success_peer.required.json"
+write_json "$TEST_TMP/topology-count-mismatch.json" '{"cdbName":"CDBA","targetContainerService":"CDBA_M1","startClusterId":"1","clusters":[{"clusterId":"1","peerClusterId":null,"realName":"exa1"},{"clusterId":"2","peerClusterId":"1","realName":"exa2"}],"dbUniqueNames":["CDBA_M1"]}'
+expect_failure "MF and Data Guard member count mismatch fails REST validation" mf_oem_validate_topology "$TEST_TMP/topology-count-mismatch.json"
 
 write_json "$TEST_TMP/malformed.json" '{not-json'
 expect_failure "malformed JSON response fails closed" mf_oem_validate_collection_page "$TEST_TMP/malformed.json"
@@ -130,8 +156,8 @@ expect_return "STOP_PENDING remains in progress" 2 mf_oem_stop_status_result STO
 expect_failure "STOP_PARTIAL is a failed stop" mf_oem_stop_status_result STOP_PARTIAL
 
 write_json "$TEST_TMP/payload-targets.json" '[
-  {"id":"cdb-a","name":"CDBA","typeName":"oracle_database","requiredCdb":"CDBA"},
-  {"id":"pdb-a","name":"PDB_CDBA","typeName":"oracle_pdb","requiredCdb":"CDBA"}
+  {"id":"cdb-a","name":"exa1_CDBA_M1","typeName":"oracle_database","member":{"clusterId":"1","realName":"exa1","dbUniqueName":"CDBA_M1","targetPrefix":"exa1_CDBA_M1","discoveryMode":"target_prefix"}},
+  {"id":"pdb-a","name":"exa1_CDBA_M1_PDB","typeName":"oracle_pdb","member":{"clusterId":"1","realName":"exa1","dbUniqueName":"CDBA_M1","targetPrefix":"exa1_CDBA_M1","discoveryMode":"target_prefix"}}
 ]'
 MF_OEM_BLACKOUT_REASON_ID=29
 MF_OEM_BLACKOUT_ALLOW_JOBS=true
@@ -194,32 +220,85 @@ write_json "$TEST_TMP/blackout-page.json" '{
 expect_success "valid blackout collection is accepted" mf_oem_validate_blackout_collection_page "$TEST_TMP/blackout-page.json"
 
 write_json "$TEST_TMP/blackouts.json" '[
-  {"id":"B-OLD","name":"MF_MIG-42","status":"ENDED","type":"PATCHING","owner":"mf-user"},
-  {"id":"B-1","name":"MF_MIG-42","status":"STARTED","type":"PATCHING","owner":"mf-user"}
+  {"id":"B-OLD","name":"MF_2_CDBA_Migration","status":"ENDED","type":"PATCHING","owner":"mf-user"},
+  {"id":"B-1","name":"MF_2_CDBA_Migration","status":"STARTED","type":"PATCHING","owner":"mf-user"},
+  {"id":"B-2","name":"MF_2_CDBA_Migration","status":"STOP_PENDING","type":"PATCHING","owner":"mf-user"},
+  {"id":"B-DATED","name":"MF_2_CDBA_Migration_20260808_153000","status":"STARTED","type":"PATCHING","owner":"mf-user"}
 ]'
-MF_OEM_TMP_FILES=()
-if mf_oem_select_active_blackout "$TEST_TMP/blackouts.json" 'MF_MIG-42' "$TEST_TMP/selected-blackout.json" \
-   && jq -e '.id == "B-1" and .status == "STARTED"' "$TEST_TMP/selected-blackout.json" >/dev/null
+if mf_oem_classify_active_blackouts "$TEST_TMP/blackouts.json" 'MF_2_CDBA_Migration' \
+     "$TEST_TMP/exact-blackouts.json" "$TEST_TMP/suffixed-blackouts.json" \
+   && [ "$(jq 'length' "$TEST_TMP/exact-blackouts.json")" = "2" ] \
+   && [ "$(jq -r '.[0].id' "$TEST_TMP/suffixed-blackouts.json")" = "B-DATED" ]
 then
-  pass "one active REST blackout is selected while ended history is ignored"
+  pass "multiple exact legacy IDs are retained while timestamp-suffixed names are separated"
 else
-  fail "one active REST blackout is selected while ended history is ignored"
+  fail "multiple exact legacy IDs are retained while timestamp-suffixed names are separated"
 fi
 
 write_json "$TEST_TMP/no-active-blackouts.json" '[
-  {"id":"B-OLD","name":"MF_MIG-42","status":"ENDED","type":"PATCHING","owner":"mf-user"}
+  {"id":"B-OLD","name":"MF_2_CDBA_Migration","status":"ENDED","type":"PATCHING","owner":"mf-user"}
 ]'
-expect_return "no active REST blackout is distinct from a lookup error" 3 \
-  mf_oem_select_active_blackout "$TEST_TMP/no-active-blackouts.json" 'MF_MIG-42' "$TEST_TMP/no-active.json"
+if mf_oem_classify_active_blackouts "$TEST_TMP/no-active-blackouts.json" 'MF_2_CDBA_Migration' \
+     "$TEST_TMP/no-active-exact.json" "$TEST_TMP/no-active-suffixed.json" \
+   && [ "$(jq 'length' "$TEST_TMP/no-active-exact.json")" = "0" ]
+then
+  pass "no canonical active blackout is a valid REST result"
+else
+  fail "no canonical active blackout is a valid REST result"
+fi
 
-write_json "$TEST_TMP/ambiguous-blackouts.json" '[
-  {"id":"B-1","name":"MF_MIG-42","status":"STARTED","type":"PATCHING","owner":"mf-user"},
-  {"id":"B-2","name":"MF_MIG-42","status":"STOP_PENDING","type":"PATCHING","owner":"mf-user"}
+MF_OEM_BLACKOUT_NAME=MF_2_CDBA_Migration
+write_json "$TEST_TMP/legacy-db-only.json" '[
+  {"id":"LEGACY-DB","name":"MF_2_CDBA_Migration","status":"STARTED","type":"PATCHING","owner":"mf-user"}
 ]'
-expect_failure "multiple active REST blackouts fail closed" \
-  mf_oem_select_active_blackout "$TEST_TMP/ambiguous-blackouts.json" 'MF_MIG-42' "$TEST_TMP/ambiguous.json"
+write_json "$TEST_TMP/legacy-db-target.json" '[
+  {"id":"cdb-a","name":"exa1_CDBA_M1","typeName":"oracle_database"}
+]'
+write_json "$TEST_TMP/full-targets.json" '[
+  {"id":"cdb-a","name":"exa1_CDBA_M1","typeName":"oracle_database"},
+  {"id":"pdb-a","name":"exa1_CDBA_M1_PDB","typeName":"oracle_pdb"}
+]'
+mf_oem_get_blackout()
+{
+  local id="$1" output="$2"
+  printf '{"id":"%s","name":"MF_2_CDBA_Migration","status":"STARTED"}\n' "$id" > "$output"
+}
+mf_oem_fetch_blackout_targets()
+{
+  case "$1" in
+    LEGACY-DB) cp "$TEST_TMP/legacy-db-target.json" "$2" ;;
+    FULL-REST) cp "$TEST_TMP/full-targets.json" "$2" ;;
+    *) return 1 ;;
+  esac
+}
+MF_OEM_TMP_FILES=()
+if mf_oem_build_blackout_coverage 'MIG-42' "$TEST_TMP/legacy-db-only.json" \
+     "$TEST_TMP/payload-targets.json" "$TEST_TMP/db-only-coverage.json" \
+   && jq -e '.complete == false and (.missingTargets | map(.typeName)) == ["oracle_pdb"]' \
+        "$TEST_TMP/db-only-coverage.json" >/dev/null
+then
+  pass "legacy database-only IDs are incomplete when PDB coverage is required"
+else
+  fail "legacy database-only IDs are incomplete when PDB coverage is required"
+fi
 
-write_json "$TEST_TMP/state-required.json" '["CDBA"]'
+write_json "$TEST_TMP/legacy-plus-full.json" '[
+  {"id":"LEGACY-DB","name":"MF_2_CDBA_Migration","status":"STARTED","type":"PATCHING","owner":"mf-user"},
+  {"id":"FULL-REST","name":"MF_2_CDBA_Migration","status":"STARTED","type":"PATCHING","owner":"mf-user"}
+]'
+MF_OEM_TMP_FILES=()
+if mf_oem_build_blackout_coverage 'MIG-42' "$TEST_TMP/legacy-plus-full.json" \
+     "$TEST_TMP/payload-targets.json" "$TEST_TMP/full-coverage.json" \
+   && jq -e '.complete == true and .fullCoverageBlackoutIds == ["FULL-REST"]' \
+        "$TEST_TMP/full-coverage.json" >/dev/null
+then
+  pass "one full REST ID satisfies coverage alongside legacy database-only IDs"
+else
+  fail "one full REST ID satisfies coverage alongside legacy database-only IDs"
+fi
+unset -f mf_oem_get_blackout mf_oem_fetch_blackout_targets
+
+write_json "$TEST_TMP/state-required.json" "$one_topology"
 write_json "$TEST_TMP/state-response.json" '{"id":"BLACKOUT-1","name":"MF_MIG-42","status":"STARTED"}'
 MF_DATA="$TEST_TMP/data"
 MF_OEM_API_BASE_URL=https://oms.example:7803
@@ -229,7 +308,8 @@ if mf_oem_prepare_state_file 'MIG-42' \
    && mf_oem_write_state 'MIG-42' "$TEST_TMP/state-required.json" \
         "$TEST_TMP/payload-targets.json" "$TEST_TMP/state-response.json" true \
    && [ "$(stat -c '%a' "$MF_OEM_BLACKOUT_STATE_FILE")" = "600" ] \
-   && jq -e '.blackoutId == "BLACKOUT-1" and .targetCoverageVerified == true and (.targets | length) == 2' \
+   && jq -e '.blackoutId == "BLACKOUT-1" and .targetCoverageVerified == true and
+             .requiredTopology.cdbName == "CDBA" and (.targets | length) == 2' \
         "$MF_OEM_BLACKOUT_STATE_FILE" >/dev/null
 then
   pass "protected state persists the blackout ID and exact target snapshot"
@@ -272,9 +352,9 @@ legacy_block=$(awk '
   capture && /^  fi$/{exit}
   capture{print}
 ' "$MAIN_SCRIPT")
-if printf '%s\n' "$legacy_block" | grep -F 'emctl start blackout' >/dev/null \
-   && printf '%s\n' "$legacy_block" | grep -F 'emctl status blackout' >/dev/null \
-   && printf '%s\n' "$legacy_block" | grep -F 'emctl stop blackout' >/dev/null
+if printf '%s\n' "$legacy_block" | grep -F '$EMCTL start blackout' >/dev/null \
+   && printf '%s\n' "$legacy_block" | grep -F '$EMCTL status blackout' >/dev/null \
+   && printf '%s\n' "$legacy_block" | grep -F '$EMCTL stop blackout' >/dev/null
 then
   pass "without -r every action retains local emctl behavior"
 else
@@ -296,6 +376,35 @@ then
   pass "-r is an explicit opt-in switch"
 else
   fail "-r is an explicit opt-in switch"
+fi
+
+if grep -F 'MF_OEM_BLACKOUT_NAME=MF_2_${CDB_NAME}_Migration' "$MAIN_SCRIPT" >/dev/null \
+   && ! grep -F 'MF_OEM_BLACKOUT_NAME=${MF_OEM_BLACKOUT_NAME:-' "$MAIN_SCRIPT" >/dev/null \
+   && grep -F 'nameMatches=${encoded}' "$SCRIPT_DIR/mfEmBlackout_oemRest.sh" >/dev/null \
+   && grep -F 'Ignoring %s active OEM blackout(s) whose name has a suffix' \
+        "$SCRIPT_DIR/mfEmBlackout_oemRest.sh" >/dev/null
+then
+  pass "the canonical blackout name is fixed and timestamp-suffixed names are warning-only"
+else
+  fail "the canonical blackout name is fixed and timestamp-suffixed names are warning-only"
+fi
+
+if ! grep -F '[ "${MF_OEM_LOOKUP_RESULT:-}" = "NOT_ACTIVE" ]' "$MAIN_SCRIPT" >/dev/null \
+   && grep -F 'OEM REST STATUS workflow failed; falling back to local emctl' "$MAIN_SCRIPT" >/dev/null \
+   && grep -F 'return 3' "$SCRIPT_DIR/mfEmBlackout_oemRest.sh" >/dev/null
+then
+  pass "semantic REST results do not trigger the temporary emctl fallback"
+else
+  fail "semantic REST results do not trigger the temporary emctl fallback"
+fi
+
+if grep -F 'limit=100&typeName=oracle_database&typeName=oracle_pdb&nameMatches=${encoded}' \
+     "$SCRIPT_DIR/mfEmBlackout_oemRest.sh" >/dev/null \
+   && grep -F 'discoveryMode: "cdb_name_fallback"' "$SCRIPT_DIR/mfEmBlackout_oemRest.sh" >/dev/null
+then
+  pass "OEM 13.5 target discovery uses one repeated-typeName call and a CDB-name fallback"
+else
+  fail "OEM 13.5 target discovery uses one repeated-typeName call and a CDB-name fallback"
 fi
 
 apex_sources=(
@@ -339,7 +448,7 @@ write_json "$TEST_TMP/page-2.json" '{
 
 curl()
 {
-  local url= output=
+  local url= output= config_line
   while [ "$#" -gt 0 ]
   do
     case "$1" in
@@ -347,6 +456,10 @@ curl()
       --output) output="$2"; shift 2 ;;
       *) shift ;;
     esac
+  done
+  while IFS= read -r config_line
+  do
+    :
   done
   case "$url" in
     *page=page-2) cp "$TEST_TMP/page-2.json" "$output" ;;
@@ -360,7 +473,7 @@ MF_OEM_API_USERNAME=test-user
 MF_OEM_API_PASSWORD=test-password
 if mf_oem_fetch_target_pages \
      "https://oms.example:7803/em/api/targets?limit=1" \
-     "/em/api/targets" "oracle_database" "CDBA" "$TEST_TMP/paginated-output.json" \
+     "/em/api/targets" "oracle_database" null "$TEST_TMP/paginated-output.json" \
    && [ "$(jq 'length' "$TEST_TMP/paginated-output.json")" = "2" ]
 then
   pass "all advertised pagination pages are processed"

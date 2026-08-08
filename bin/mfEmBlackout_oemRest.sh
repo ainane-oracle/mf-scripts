@@ -12,10 +12,10 @@
 #               files, or temporary files. REST working files are mode 600 and
 #               are removed when the operation completes.
 #
-# Lookup      : Blackout lookup first uses an exact `name` query. If the OEM
-#               endpoint rejects it or no active exact match is found, lookup
-#               falls back to `nameMatches=%<blackout_name>%`. Multiple active
-#               matches remain an error to prevent selecting the wrong blackout.
+# Lookup      : Blackout lookup uses the canonical name prefix so timestamped
+#               or otherwise suffixed names can be reported and ignored. Only
+#               exact canonical names contribute target coverage. Multiple
+#               legacy IDs are aggregated by their verified target membership.
 #
 # Compatibility: Sort parameters were removed because the deployed OEM API does
 #               not accept the previously used id/name sort fields. Results are
@@ -26,7 +26,7 @@
 #
 # Modifications:
 # - REST support is opt-in from mfEmBlackout.sh via -r.
-# - Added exact-name lookup with a nameMatches wildcard fallback.
+# - Added exact canonical-name and aggregate target-coverage validation.
 # - Removed unsupported sort query parameters from REST collection requests.
 # - Added protected blackout state persistence for later verification/STOP use.
 # -----------------------------------------------------------------------------
@@ -326,74 +326,59 @@ mf_oem_fetch_blackout_pages()
   done
 }
 
-mf_oem_select_active_blackout()
+mf_oem_classify_active_blackouts()
 {
   local blackouts_file="$1"
   local blackout_name="$2"
-  local output_file="$3"
-  local match_mode="${4:-exact}"
-  local selected_file count
+  local exact_file="$3"
+  local suffixed_file="$4"
 
-  mf_oem_new_temp_file selected_file || return 1
-  if [ "$match_mode" = "contains" ]
-  then
-    jq --arg name "$blackout_name" '
-      [ .[] |
-        select(.name | contains($name)) |
-        select(.status as $status | [
-          "SCHEDULED", "START_PROCESSING", "START_PARTIAL", "STARTED",
-          "STOP_PENDING", "STOP_FAILED", "STOP_PARTIAL",
-          "EDIT_PENDING", "EDIT_FAILED", "EDIT_PARTIAL", "END_PARTIAL"
-        ] | index($status) != null)
-      ] | unique_by(.id)
-    ' "$blackouts_file" > "$selected_file" \
-      || mf_oem_error "Unable to select the active OEM blackout" || return 1
-  else
-    jq --arg name "$blackout_name" '
-      [ .[] |
-        select(.name == $name) |
-        select(.status as $status | [
-          "SCHEDULED", "START_PROCESSING", "START_PARTIAL", "STARTED",
-          "STOP_PENDING", "STOP_FAILED", "STOP_PARTIAL",
-          "EDIT_PENDING", "EDIT_FAILED", "EDIT_PARTIAL", "END_PARTIAL"
-        ] | index($status) != null)
-      ] | unique_by(.id)
-    ' "$blackouts_file" > "$selected_file" \
-      || mf_oem_error "Unable to select the active OEM blackout" || return 1
-  fi
+  jq --arg name "$blackout_name" '
+    def active($status): [
+      "SCHEDULED", "START_PROCESSING", "START_PARTIAL", "STARTED",
+      "STOP_PENDING", "STOP_FAILED", "STOP_PARTIAL",
+      "EDIT_PENDING", "EDIT_FAILED", "EDIT_PARTIAL", "END_PARTIAL"
+    ] | index($status) != null;
+    [ .[] | select(.name == $name) | select(active(.status)) ] | unique_by(.id)
+  ' "$blackouts_file" > "$exact_file" \
+    || mf_oem_error "Unable to select exact-name active OEM blackouts" || return 1
 
-  count=$(jq 'length' "$selected_file") || return 1
-  case "$count" in
-    0) return 3 ;;
-    1) jq '.[0]' "$selected_file" > "$output_file" || return 1 ;;
-    *) mf_oem_error "More than one active OEM blackout has the exact name $blackout_name"; return 1 ;;
-  esac
+  jq --arg prefix "${blackout_name}_" '
+    def active($status): [
+      "SCHEDULED", "START_PROCESSING", "START_PARTIAL", "STARTED",
+      "STOP_PENDING", "STOP_FAILED", "STOP_PARTIAL",
+      "EDIT_PENDING", "EDIT_FAILED", "EDIT_PARTIAL", "END_PARTIAL"
+    ] | index($status) != null;
+    [ .[] | select(.name | startswith($prefix)) | select(active(.status)) ] | unique_by(.id)
+  ' "$blackouts_file" > "$suffixed_file" \
+    || mf_oem_error "Unable to identify non-canonical OEM blackout names"
 }
 
-mf_oem_find_active_blackout()
+mf_oem_find_active_blackouts()
 {
   local migration_id="$1"
   local output_file="$2"
+  local suffixed_file="$3"
   local blackout_name
-  local encoded url blackouts_file fallback_file rc
+  local encoded url blackouts_file suffixed_count
 
   blackout_name=$(mf_oem_blackout_name "$migration_id") || return 1
-
-  encoded=$(printf '%s' "$blackout_name" | mf_oem_urlencode) || return 1
-  url="${MF_OEM_API_BASE_URL}/em/api/blackouts?limit=2000&name=${encoded}"
-  mf_oem_new_temp_file blackouts_file || return 1
-  if mf_oem_fetch_blackout_pages "$url" "$blackouts_file"
-  then
-    mf_oem_select_active_blackout "$blackouts_file" "$blackout_name" "$output_file"
-    rc=$?
-    [ "$rc" -eq 0 ] && return 0
-  fi
-
-  encoded=$(printf '%%%s%%' "$blackout_name" | mf_oem_urlencode) || return 1
+  encoded=$(printf '%s%%' "$blackout_name" | mf_oem_urlencode) || return 1
   url="${MF_OEM_API_BASE_URL}/em/api/blackouts?limit=2000&nameMatches=${encoded}"
-  mf_oem_new_temp_file fallback_file || return 1
-  mf_oem_fetch_blackout_pages "$url" "$fallback_file" || return 1
-  mf_oem_select_active_blackout "$fallback_file" "$blackout_name" "$output_file" contains
+  mf_oem_new_temp_file blackouts_file || return 1
+  mf_oem_fetch_blackout_pages "$url" "$blackouts_file" || return 1
+
+  mf_oem_classify_active_blackouts "$blackouts_file" "$blackout_name" \
+    "$output_file" "$suffixed_file" || return 1
+
+  suffixed_count=$(jq 'length' "$suffixed_file") || return 1
+  if [ "$suffixed_count" -gt 0 ]
+  then
+    printf 'WARNING: Ignoring %s active OEM blackout(s) whose name has a suffix; canonical name is %s\n' \
+      "$suffixed_count" "$blackout_name" >&2
+    jq -r '.[] | "WARNING: Ignored OEM blackout ID \(.id), name \(.name), status \(.status)"' \
+      "$suffixed_file" >&2 || return 1
+  fi
 }
 
 mf_oem_append_json_array()
@@ -405,6 +390,152 @@ mf_oem_append_json_array()
   jq --slurpfile source "$source" '. + $source[0]' "$destination" > "$merged" \
     || mf_oem_error "Unable to merge resolved targets" || return 1
   mv -f -- "$merged" "$destination" || return 1
+}
+
+mf_oem_fetch_blackout_targets()
+{
+  local blackout_id="$1"
+  local output_file="$2"
+  mf_oem_fetch_target_pages \
+    "${MF_OEM_API_BASE_URL}/em/api/blackouts/${blackout_id}/targets?limit=2000" \
+    "/em/api/blackouts/${blackout_id}/targets" \
+    "oracle_database,oracle_pdb" null "$output_file"
+}
+
+mf_oem_build_blackout_coverage()
+{
+  local migration_id="$1"
+  local blackouts_file="$2"
+  local expected_file="$3"
+  local output_file="$4"
+  local blackout_name summary blackout_id current_status
+  local detail_file actual_file covered_file normalized_file full_ids_file stop_ids_file merged_file
+
+  blackout_name=$(mf_oem_blackout_name "$migration_id") || return 1
+  mf_oem_new_temp_file covered_file || return 1
+  mf_oem_new_temp_file full_ids_file || return 1
+  mf_oem_new_temp_file stop_ids_file || return 1
+  printf '[]\n' > "$covered_file" || return 1
+  printf '[]\n' > "$full_ids_file" || return 1
+  printf '[]\n' > "$stop_ids_file" || return 1
+
+  while IFS= read -r summary
+  do
+    blackout_id=$(printf '%s' "$summary" | jq -er '.id') || return 1
+    [[ "$blackout_id" =~ ^[A-Za-z0-9._-]+$ ]] \
+      || mf_oem_error "OEM returned an unsafe blackout ID" || return 1
+
+    mf_oem_new_temp_file detail_file || return 1
+    mf_oem_get_blackout "$blackout_id" "$detail_file" || return 1
+    if ! jq -e --arg name "$blackout_name" '
+      .name == $name and
+      (.status as $status | [
+        "SCHEDULED", "START_PROCESSING", "START_PARTIAL", "STARTED",
+        "STOP_PENDING", "STOP_FAILED", "STOP_PARTIAL",
+        "EDIT_PENDING", "EDIT_FAILED", "EDIT_PARTIAL", "END_PARTIAL"
+      ] | index($status) != null)
+    ' "$detail_file" >/dev/null
+    then
+      printf 'WARNING: Ignoring OEM blackout ID %s because its current name or status is not canonical and active\n' \
+        "$blackout_id" >&2
+      continue
+    fi
+    current_status=$(jq -r '.status' "$detail_file") || return 1
+
+    mf_oem_new_temp_file actual_file || return 1
+    mf_oem_fetch_blackout_targets "$blackout_id" "$actual_file" || return 1
+    if ! jq -n -e --slurpfile expected "$expected_file" --slurpfile actual "$actual_file" '
+      $actual[0] | all(. as $target |
+        ([ $expected[0][] |
+           select(.id == $target.id and .name == $target.name and .typeName == $target.typeName)
+         ] | length) == 1)
+    ' >/dev/null
+    then
+      printf 'WARNING: Ignoring OEM blackout ID %s because it contains targets outside the resolved migration target set\n' \
+        "$blackout_id" >&2
+      continue
+    fi
+
+    if [ "$current_status" = "STARTED" ]
+    then
+      mf_oem_append_json_array "$covered_file" "$actual_file" || return 1
+    fi
+    if jq -n -e --slurpfile expected "$expected_file" --slurpfile actual "$actual_file" '
+      ([ $expected[0][] | [.id, .name, .typeName] ] | sort | unique) ==
+      ([ $actual[0][] | [.id, .name, .typeName] ] | sort | unique)
+    ' >/dev/null
+    then
+      if [ "$current_status" = "STARTED" ]
+      then
+        mf_oem_new_temp_file merged_file || return 1
+        jq --arg id "$blackout_id" '. + [$id] | unique' "$full_ids_file" > "$merged_file" || return 1
+        mv -f -- "$merged_file" "$full_ids_file" || return 1
+      fi
+      if [ "$current_status" = "STARTED" ] || [ "$current_status" = "STOP_PENDING" ]
+      then
+        mf_oem_new_temp_file merged_file || return 1
+        jq --arg id "$blackout_id" '. + [$id] | unique' "$stop_ids_file" > "$merged_file" || return 1
+        mv -f -- "$merged_file" "$stop_ids_file" || return 1
+      fi
+    fi
+  done < <(jq -c '.[]' "$blackouts_file")
+
+  mf_oem_new_temp_file normalized_file || return 1
+  jq 'sort_by(.id) | unique_by(.id)' "$covered_file" > "$normalized_file" || return 1
+  mv -f -- "$normalized_file" "$covered_file" || return 1
+
+  jq -n \
+    --slurpfile blackouts "$blackouts_file" \
+    --slurpfile expected "$expected_file" \
+    --slurpfile covered "$covered_file" \
+    --slurpfile fullIds "$full_ids_file" \
+    --slurpfile stopIds "$stop_ids_file" '
+      ($covered[0] | map(.id) | unique) as $coveredIds |
+      {
+        exactBlackoutIds: ($blackouts[0] | map(.id) | unique),
+        fullCoverageBlackoutIds: $fullIds[0],
+        stoppableFullCoverageBlackoutIds: $stopIds[0],
+        expectedTargets: $expected[0],
+        coveredTargets: $covered[0],
+        missingTargets: [ $expected[0][] | select(.id as $id | ($coveredIds | index($id)) == null) ],
+        complete: (($expected[0] | length) > 0 and
+                   ([ $expected[0][].id ] | unique | length) == ($coveredIds | length))
+      }
+  ' > "$output_file" || mf_oem_error "Unable to build OEM blackout target coverage" || return 1
+}
+
+mf_oem_print_blackout_coverage()
+{
+  local migration_id="$1"
+  local coverage_file="$2"
+  jq -r --arg name "$(mf_oem_blackout_name "$migration_id")" '
+    def count_type($items; $type): [$items[] | select(.typeName == $type)] | length;
+    "OEM canonical name     : \($name)",
+    "OEM active exact IDs  : \(.exactBlackoutIds | length)",
+    "oracle_database       : \(count_type(.coveredTargets; "oracle_database"))/\(count_type(.expectedTargets; "oracle_database")) covered",
+    "oracle_pdb            : \(count_type(.coveredTargets; "oracle_pdb"))/\(count_type(.expectedTargets; "oracle_pdb")) covered",
+    "OEM target coverage   : \(if .complete then "COMPLETE" elif (.coveredTargets | length) == 0 then "NOT ACTIVE" else "INCOMPLETE" end)"
+  ' "$coverage_file" || mf_oem_error "Unable to format OEM blackout coverage"
+}
+
+mf_oem_evaluate_blackout_coverage()
+{
+  local migration_id="$1"
+  local repository_migration_id="$2"
+  local cdb_name="$3"
+  local target_container_service="$4"
+  local topology_file="$5"
+  local targets_file="$6"
+  local coverage_file="$7"
+  local blackouts_file suffixed_file
+
+  mf_oem_resolve_topology "$repository_migration_id" "$cdb_name" \
+    "$target_container_service" "$topology_file" || return 1
+  mf_oem_discover_targets "$topology_file" "$targets_file" || return 1
+  mf_oem_new_temp_file blackouts_file || return 1
+  mf_oem_new_temp_file suffixed_file || return 1
+  mf_oem_find_active_blackouts "$migration_id" "$blackouts_file" "$suffixed_file" || return 1
+  mf_oem_build_blackout_coverage "$migration_id" "$blackouts_file" "$targets_file" "$coverage_file"
 }
 
 mf_oem_validate_resolved_targets()
@@ -450,6 +581,7 @@ mf_oem_validate_resolved_targets()
          .id
        ] | unique | length) >= 1
     )) and
+    ([ $resolved[] | select(.typeName == "oracle_pdb") | .id ] | unique | length) >= 1 and
     ($required.dbUniqueNames | all(. as $dbUniqueName |
       ([ $resolved[] | select(.member.dbUniqueName == $dbUniqueName) | .member.clusterId ] | unique | length) == 1
     )) and
@@ -854,34 +986,32 @@ mf_oem_start_blackout()
   local cdb_name="$3"
   local target_container_service="$4"
   local time_to_end="$5"
-  local topology_file targets_file payload_file response_file blackout_id
-  local active_file active_rc active_status
+  local topology_file targets_file coverage_file payload_file response_file blackout_id
 
   umask 077
+  MF_OEM_BLACKOUT_NAME=MF_2_${cdb_name}_Migration
   MF_OEM_TMP_FILES=()
   MF_OEM_START_MUTATION_ATTEMPTED=N
   mf_oem_validate_config || return 1
-  mf_oem_new_temp_file active_file || return 1
-  mf_oem_find_active_blackout "$migration_id" "$active_file"
-  active_rc=$?
-  case "$active_rc" in
-    0)
-      active_status=$(jq -r '.status' "$active_file") || return 1
-      mf_oem_error "An OEM blackout named $(mf_oem_blackout_name "$migration_id") is already active with status $active_status"
-      return 1
-      ;;
-    3) : ;;
-    *) return 1 ;;
-  esac
-  mf_oem_prepare_state_file "$migration_id" || return 1
   mf_oem_new_temp_file topology_file || return 1
   mf_oem_new_temp_file targets_file || return 1
+  mf_oem_new_temp_file coverage_file || return 1
   mf_oem_new_temp_file payload_file || return 1
   mf_oem_new_temp_file response_file || return 1
 
-  mf_oem_resolve_topology "$repository_migration_id" "$cdb_name" \
-    "$target_container_service" "$topology_file" || return 1
-  mf_oem_discover_targets "$topology_file" "$targets_file" || return 1
+  mf_oem_evaluate_blackout_coverage "$migration_id" "$repository_migration_id" \
+    "$cdb_name" "$target_container_service" "$topology_file" "$targets_file" \
+    "$coverage_file" || return 1
+  mf_oem_print_blackout_coverage "$migration_id" "$coverage_file" || return 1
+  if [ "$(jq -r '.complete' "$coverage_file")" = "true" ]
+  then
+    printf 'OEM blackout coverage is already complete; no new blackout was created.\n'
+    return 0
+  fi
+
+  printf 'WARNING: Canonical OEM blackout coverage is missing %s target(s); creating one complete REST blackout.\n' \
+    "$(jq '.missingTargets | length' "$coverage_file")" >&2
+  mf_oem_prepare_state_file "$migration_id" || return 1
   mf_oem_build_payload "$migration_id" "$targets_file" "$time_to_end" "$payload_file" || return 1
   # A network failure after this point is ambiguous: OEM may have created the
   # blackout even when curl did not receive a response. The caller must not
@@ -890,6 +1020,9 @@ mf_oem_start_blackout()
   mf_oem_http POST "${MF_OEM_API_BASE_URL}/em/api/blackouts" "$response_file" "$payload_file" || return 1
   mf_oem_expect_http "$MF_OEM_HTTP_STATUS" 201 "Blackout creation" || return 1
   mf_oem_validate_blackout_response "$response_file" || return 1
+  jq -e --arg name "$(mf_oem_blackout_name "$migration_id")" '.name == $name' \
+    "$response_file" >/dev/null \
+    || mf_oem_error "OEM created a blackout whose name is not the canonical Migration Factory name" || return 1
   blackout_id=$(jq -r '.id' "$response_file") || return 1
   [[ "$blackout_id" =~ ^[A-Za-z0-9._-]+$ ]] \
     || mf_oem_error "OEM returned an unsafe blackout ID" || return 1
@@ -920,97 +1053,116 @@ mf_oem_start_blackout()
 mf_oem_status_blackout()
 {
   local migration_id="$1"
-  local active_file response_file blackout_id rc
+  local repository_migration_id="$2"
+  local cdb_name="$3"
+  local target_container_service="$4"
+  local topology_file targets_file coverage_file
 
   umask 077
+  MF_OEM_BLACKOUT_NAME=MF_2_${cdb_name}_Migration
   MF_OEM_TMP_FILES=()
   MF_OEM_LOOKUP_RESULT=
   mf_oem_validate_config || return 1
-  mf_oem_new_temp_file active_file || return 1
-  mf_oem_find_active_blackout "$migration_id" "$active_file"
-  rc=$?
-  case "$rc" in
-    0) : ;;
-    3) MF_OEM_LOOKUP_RESULT=NOT_ACTIVE; printf 'OEM blackout %s: NOT ACTIVE\n' "$(mf_oem_blackout_name "$migration_id")"; return 0 ;;
-    *) return 1 ;;
-  esac
-
-  blackout_id=$(jq -r '.id' "$active_file") || return 1
-  [[ "$blackout_id" =~ ^[A-Za-z0-9._-]+$ ]] \
-    || mf_oem_error "OEM returned an unsafe blackout ID" || return 1
-  mf_oem_new_temp_file response_file || return 1
-  mf_oem_get_blackout "$blackout_id" "$response_file" || return 1
-  mf_oem_print_blackout "$response_file"
+  mf_oem_new_temp_file topology_file || return 1
+  mf_oem_new_temp_file targets_file || return 1
+  mf_oem_new_temp_file coverage_file || return 1
+  mf_oem_evaluate_blackout_coverage "$migration_id" "$repository_migration_id" \
+    "$cdb_name" "$target_container_service" "$topology_file" "$targets_file" \
+    "$coverage_file" || return 1
+  mf_oem_print_blackout_coverage "$migration_id" "$coverage_file" || return 1
+  [ "$(jq '.coveredTargets | length' "$coverage_file")" -gt 0 ] \
+    || MF_OEM_LOOKUP_RESULT=NOT_ACTIVE
 }
 
 mf_oem_is_blackout_on()
 {
   local migration_id="$1"
-  local active_file response_file blackout_id status rc
+  local repository_migration_id="$2"
+  local cdb_name="$3"
+  local target_container_service="$4"
+  local topology_file targets_file coverage_file
 
   umask 077
+  MF_OEM_BLACKOUT_NAME=MF_2_${cdb_name}_Migration
   MF_OEM_TMP_FILES=()
   mf_oem_validate_config || return 1
-  mf_oem_new_temp_file active_file || return 1
-  mf_oem_find_active_blackout "$migration_id" "$active_file"
-  rc=$?
-  case "$rc" in
-    0) : ;;
-    3) printf 'OEM blackout %s: NOT ACTIVE\n' "$(mf_oem_blackout_name "$migration_id")"; return 1 ;;
-    *) return 1 ;;
-  esac
-
-  blackout_id=$(jq -r '.id' "$active_file") || return 1
-  [[ "$blackout_id" =~ ^[A-Za-z0-9._-]+$ ]] \
-    || mf_oem_error "OEM returned an unsafe blackout ID" || return 1
-  mf_oem_new_temp_file response_file || return 1
-  mf_oem_get_blackout "$blackout_id" "$response_file" || return 1
-  status=$(jq -r '.status' "$response_file") || return 1
-  if [ "$status" = "STARTED" ]
+  mf_oem_new_temp_file topology_file || return 1
+  mf_oem_new_temp_file targets_file || return 1
+  mf_oem_new_temp_file coverage_file || return 1
+  mf_oem_evaluate_blackout_coverage "$migration_id" "$repository_migration_id" \
+    "$cdb_name" "$target_container_service" "$topology_file" "$targets_file" \
+    "$coverage_file" || return 1
+  mf_oem_print_blackout_coverage "$migration_id" "$coverage_file" || return 1
+  if [ "$(jq -r '.complete' "$coverage_file")" = "true" ]
   then
-    printf 'OEM blackout %s is ON\n' "$(mf_oem_blackout_name "$migration_id")"
+    printf 'OEM blackout coverage is fully ON.\n'
     return 0
   fi
-  printf 'OEM blackout %s is not fully ON (status: %s)\n' "$(mf_oem_blackout_name "$migration_id")" "$status"
-  return 1
+  printf 'OEM blackout coverage is not fully ON.\n'
+  return 3
 }
 
 mf_oem_stop_blackout()
 {
   local migration_id="$1"
-  local active_file response_file stop_file blackout_id status rc
+  local repository_migration_id="$2"
+  local cdb_name="$3"
+  local target_container_service="$4"
+  local topology_file targets_file coverage_file response_file stop_file
+  local blackout_id status full_count
 
   umask 077
+  MF_OEM_BLACKOUT_NAME=MF_2_${cdb_name}_Migration
   MF_OEM_TMP_FILES=()
   MF_OEM_STOP_MUTATION_ATTEMPTED=N
   mf_oem_validate_config || return 1
-  mf_oem_new_temp_file active_file || return 1
-  mf_oem_find_active_blackout "$migration_id" "$active_file"
-  rc=$?
-  case "$rc" in
-    0) : ;;
-    3) mf_oem_error "No active OEM blackout named $(mf_oem_blackout_name "$migration_id") was found"; return 1 ;;
-    *) return 1 ;;
-  esac
+  mf_oem_new_temp_file topology_file || return 1
+  mf_oem_new_temp_file targets_file || return 1
+  mf_oem_new_temp_file coverage_file || return 1
+  mf_oem_evaluate_blackout_coverage "$migration_id" "$repository_migration_id" \
+    "$cdb_name" "$target_container_service" "$topology_file" "$targets_file" \
+    "$coverage_file" || return 1
+  mf_oem_print_blackout_coverage "$migration_id" "$coverage_file" || return 1
 
-  blackout_id=$(jq -r '.id' "$active_file") || return 1
+  full_count=$(jq '.stoppableFullCoverageBlackoutIds | length' "$coverage_file") || return 1
+  if [ "$full_count" -eq 0 ]
+  then
+    mf_oem_error "No single active canonical REST blackout has complete database and PDB target coverage"
+    return 3
+  elif [ "$full_count" -gt 1 ]
+  then
+    mf_oem_error "More than one active canonical REST blackout has complete target coverage"
+    return 4
+  fi
+
+  blackout_id=$(jq -r '.stoppableFullCoverageBlackoutIds[0]' "$coverage_file") || return 1
   [[ "$blackout_id" =~ ^[A-Za-z0-9._-]+$ ]] \
     || mf_oem_error "OEM returned an unsafe blackout ID" || return 1
   mf_oem_new_temp_file response_file || return 1
   mf_oem_get_blackout "$blackout_id" "$response_file" || return 1
   status=$(jq -r '.status' "$response_file") || return 1
 
-  if [ "$status" != "STOP_PENDING" ]
-  then
-    mf_oem_new_temp_file stop_file || return 1
-    # Once a stop request is attempted, its outcome may be unknown even if the
-    # transport fails. Do not let callers issue an unrelated local fallback.
-    MF_OEM_STOP_MUTATION_ATTEMPTED=Y
-    mf_oem_http POST "${MF_OEM_API_BASE_URL}/em/api/blackouts/${blackout_id}/actions/stop" "$stop_file" || return 1
-    mf_oem_expect_http "$MF_OEM_HTTP_STATUS" 204 "Blackout stop" || return 1
-  else
-    MF_OEM_STOP_MUTATION_ATTEMPTED=Y
-  fi
+  case "$status" in
+    STARTED)
+      mf_oem_new_temp_file stop_file || return 1
+      # Once a stop request is attempted, its outcome may be unknown even if the
+      # transport fails. Do not let callers issue an unrelated local fallback.
+      MF_OEM_STOP_MUTATION_ATTEMPTED=Y
+      mf_oem_http POST "${MF_OEM_API_BASE_URL}/em/api/blackouts/${blackout_id}/actions/stop" "$stop_file" || return 1
+      mf_oem_expect_http "$MF_OEM_HTTP_STATUS" 204 "Blackout stop" || return 1
+      ;;
+    STOP_PENDING)
+      MF_OEM_STOP_MUTATION_ATTEMPTED=Y
+      ;;
+    STOPPED|ENDED)
+      mf_oem_print_blackout "$response_file"
+      return 0
+      ;;
+    *)
+      mf_oem_error "Canonical OEM blackout changed to non-stoppable status $status"
+      return 4
+      ;;
+  esac
 
   mf_oem_wait_for_stopped "$blackout_id" "$response_file" || return 1
   mf_oem_print_blackout "$response_file"
