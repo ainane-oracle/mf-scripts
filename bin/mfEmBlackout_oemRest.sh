@@ -14,7 +14,7 @@
 #
 # Lookup      : Blackout lookup first uses an exact `name` query. If the OEM
 #               endpoint rejects it or no active exact match is found, lookup
-#               falls back to `nameMatches=*<blackout_name>*`. Multiple active
+#               falls back to `nameMatches=%<blackout_name>%`. Multiple active
 #               matches remain an error to prevent selecting the wrong blackout.
 #
 # Compatibility: Sort parameters were removed because the deployed OEM API does
@@ -235,8 +235,8 @@ mf_oem_fetch_target_pages()
 {
   local first_url="$1"
   local allowed_path="$2"
-  local expected_type="$3"
-  local required_cdb="$4"
+  local expected_types="$3"
+  local member_json="${4:-null}"
   local output_file="$5"
   local url="$first_url"
   local page_file next_href next_url
@@ -259,15 +259,18 @@ mf_oem_fetch_target_pages()
     mf_oem_expect_http "$MF_OEM_HTTP_STATUS" 200 "Target discovery" || return 1
     mf_oem_validate_collection_page "$page_file" || return 1
 
-    if [ -n "$expected_type" ]
+    if [ -n "$expected_types" ]
     then
-      jq -e --arg type "$expected_type" '.items | all(.typeName == $type)' "$page_file" >/dev/null \
+      jq -e --arg types "$expected_types" \
+        '.items | all(.typeName as $type | ($types | split(",") | index($type)) != null)' \
+        "$page_file" >/dev/null \
         || mf_oem_error "OEM returned an unexpected target type" || return 1
     fi
 
     mf_oem_new_temp_file merged_file || return 1
-    jq --arg cdb "$required_cdb" --slurpfile page "$page_file" \
-      '. + ($page[0].items | map(. + {requiredCdb: $cdb}))' "$output_file" > "$merged_file" \
+    jq --argjson member "$member_json" --slurpfile page "$page_file" \
+      '. + ($page[0].items | map(. + (if $member == null then {} else {member: $member} end)))' \
+      "$output_file" > "$merged_file" \
       || mf_oem_error "Unable to merge OEM target results" || return 1
     mv -f -- "$merged_file" "$output_file" || return 1
 
@@ -386,7 +389,7 @@ mf_oem_find_active_blackout()
     [ "$rc" -eq 0 ] && return 0
   fi
 
-  encoded=$(printf '*%s*' "$blackout_name" | mf_oem_urlencode) || return 1
+  encoded=$(printf '%%%s%%' "$blackout_name" | mf_oem_urlencode) || return 1
   url="${MF_OEM_API_BASE_URL}/em/api/blackouts?limit=2000&nameMatches=${encoded}"
   mf_oem_new_temp_file fallback_file || return 1
   mf_oem_fetch_blackout_pages "$url" "$fallback_file" || return 1
@@ -406,88 +409,247 @@ mf_oem_append_json_array()
 
 mf_oem_validate_resolved_targets()
 {
-  local required_file="$1"
+  local topology_file="$1"
   local targets_file="$2"
   local normalized_file="$3"
 
-  jq -n -e --slurpfile required "$required_file" --slurpfile targets "$targets_file" '
-    ($targets[0] | type == "array" and length > 0 and all(
+  jq -n -e --slurpfile topology "$topology_file" --slurpfile targets "$targets_file" '
+    ($topology[0]) as $required |
+    ($targets[0]) as $resolved |
+    ($resolved | type == "array" and length > 0 and all(
       type == "object" and
       (.id | type == "string" and length > 0) and
       (.name | type == "string" and length > 0) and
       (.typeName == "oracle_database" or .typeName == "oracle_pdb") and
-      (.requiredCdb | type == "string" and length > 0)
+      (.member | type == "object") and
+      (.member.clusterId | type == "string" and length > 0) and
+      (.member.realName | type == "string" and length > 0) and
+      (.member.dbUniqueName | type == "string" and length > 0) and
+      (.member.targetPrefix | type == "string" and length > 0) and
+      (.member.discoveryMode == "target_prefix" or .member.discoveryMode == "cdb_name_fallback")
     )) and
-    ($targets[0] | group_by(.id) | all((map([.name, .typeName, .requiredCdb]) | unique | length) == 1)) and
-    ($targets[0] | group_by([.name, .typeName]) | all((map(.id) | unique | length) == 1)) and
-    ($required[0] | type == "array" and length > 0 and all(. as $cdb |
-      ([ $targets[0][] | select(.requiredCdb == $cdb and .typeName == "oracle_database" and .name == $cdb) | .id ] | unique | length) == 1
+    ($resolved | group_by(.id) | all((map([
+      .name, .typeName, .member.clusterId, .member.realName,
+      .member.dbUniqueName, .member.targetPrefix
+    ]) | unique | length) == 1)) and
+    ($resolved | group_by([.name, .typeName]) | all((map(.id) | unique | length) == 1)) and
+    ($resolved | all(. as $target |
+      (($target.name | ascii_downcase) | startswith($target.member.targetPrefix | ascii_downcase)) and
+      ($required.dbUniqueNames | index($target.member.dbUniqueName)) != null and
+      ([ $required.clusters[] |
+         select(.clusterId == $target.member.clusterId and
+                (.realName | ascii_downcase) == ($target.member.realName | ascii_downcase))
+       ] | length) == 1 and
+      ($target.member.targetPrefix | ascii_downcase) ==
+        (($target.member.realName | ascii_downcase) + "_" + ($target.member.dbUniqueName | ascii_downcase))
     )) and
-    ($targets[0] | all(. as $target |
-      ($required[0] | index($target.requiredCdb)) != null and
-      (if $target.typeName == "oracle_database" then $target.name == $target.requiredCdb
-       else ($target.name | contains($target.requiredCdb)) end)
-    ))
+    ($required.clusters | all(. as $cluster |
+      ([ $resolved[] | select(.member.clusterId == $cluster.clusterId) | .member.dbUniqueName ] | unique | length) == 1 and
+      ([ $resolved[] |
+         select(.member.clusterId == $cluster.clusterId and .typeName == "oracle_database") |
+         .id
+       ] | unique | length) >= 1
+    )) and
+    ($required.dbUniqueNames | all(. as $dbUniqueName |
+      ([ $resolved[] | select(.member.dbUniqueName == $dbUniqueName) | .member.clusterId ] | unique | length) == 1
+    )) and
+    ([ $resolved[].member.clusterId ] | unique | length) == ($required.clusters | length) and
+    ([ $resolved[].member.dbUniqueName ] | unique | length) == ($required.dbUniqueNames | length)
   ' >/dev/null 2>&1 || mf_oem_error "Missing, duplicate, ambiguous, or unexpected OEM targets" || return 1
 
   jq 'sort_by(.id) | unique_by(.id)' "$targets_file" > "$normalized_file" \
     || mf_oem_error "Unable to normalize OEM targets" || return 1
 }
 
-mf_oem_parse_required_cdb_names()
+mf_oem_validate_topology()
 {
-  local primary_cdb="$1"
-  local peer_count="$2"
+  local topology_file="$1"
+  jq -e '
+    def db_name_from_unique_name:
+      if contains("_") then split("_")[0]
+      elif test("^C.*M[0-9]*$") then sub("M[0-9]*$"; "")
+      else . end;
+    . as $topology |
+    ($topology.targetContainerService | ascii_downcase) as $selectedService |
+    ($topology.cdbName | ascii_downcase) as $cdbName |
+    ($topology | type == "object") and
+    ($topology.cdbName | type == "string" and length > 0) and
+    ($topology.targetContainerService | type == "string" and length > 0) and
+    ($topology.startClusterId | type == "string" and length > 0) and
+    ($topology.clusters | type == "array" and length > 0 and all(
+      type == "object" and
+      (.clusterId | type == "string" and length > 0) and
+      ((.peerClusterId == null) or (.peerClusterId | type == "string" and length > 0)) and
+      (.realName | type == "string" and length > 0)
+    )) and
+    ($topology.dbUniqueNames | type == "array" and length > 0 and all(type == "string" and length > 0)) and
+    ($topology.clusters | map(.clusterId) | unique | length) == ($topology.clusters | length) and
+    ($topology.clusters | map(.realName | ascii_downcase) | unique | length) == ($topology.clusters | length) and
+    ($topology.clusters | map(.clusterId) | index($topology.startClusterId)) != null and
+    ($topology.clusters | all(.peerClusterId == null or
+      (.peerClusterId as $peer | [$topology.clusters[].clusterId] | index($peer)) != null)) and
+    ($topology.dbUniqueNames | unique | length) == ($topology.dbUniqueNames | length) and
+    ($topology.clusters | length) == ($topology.dbUniqueNames | length) and
+    ([$topology.dbUniqueNames[] | ascii_downcase] | index($selectedService)) != null and
+    ($topology.dbUniqueNames | all((db_name_from_unique_name | ascii_downcase) == $cdbName))
+  ' "$topology_file" >/dev/null 2>&1 \
+    || mf_oem_error "MF cluster topology and Data Guard members are missing, stale, or inconsistent"
+}
+
+mf_oem_resolve_topology()
+{
+  local repository_migration_id="$1"
+  local cdb_name="$2"
+  local target_container_service="$3"
+  local output_file="$4"
+  local cluster_rows db_unique_names
+
+  [[ "$repository_migration_id" =~ ^[0-9]+$ ]] \
+    || mf_oem_error "The internal MF migration ID must be numeric" || return 1
+
+  cluster_rows=$(exec_sql "$MF_REPO_CONNECT" "
+    select distinct
+           to_char((select tclu_id from migration_attempts where mig_id = $repository_migration_id)) || '|' ||
+           to_char(tc.tclu_id) || '|' ||
+           nvl(to_char(tc.peer_tclu_id), '') || '|' ||
+           lower(trim(tc.real_name))
+    from target_clusters tc
+    where tc.prj_name = (select prj_name from migration_attempts where mig_id = $repository_migration_id)
+    start with tc.tclu_id = (select tclu_id from migration_attempts where mig_id = $repository_migration_id)
+    connect by nocycle
+           prior tc.prj_name = tc.prj_name
+       and (prior tc.tclu_id = tc.peer_tclu_id or prior tc.peer_tclu_id = tc.tclu_id);") \
+    || mf_oem_error "Unable to resolve the connected MF target clusters" || return 1
+
+  db_unique_names=$(exec_sql "$MF_TGT_CDB_CONNECT" "
+    select db_unique_name from v\$database
+    union
+    select db_unique_name from v\$dataguard_config;") \
+    || mf_oem_error "Unable to resolve Data Guard DB_UNIQUE_NAME members" || return 1
+
+  jq -n \
+    --arg clusterRows "$cluster_rows" \
+    --arg dbUniqueNames "$db_unique_names" \
+    --arg cdbName "$cdb_name" \
+    --arg targetContainerService "$target_container_service" '
+      def lines($value):
+        $value | gsub("\\r"; "") | split("\n") |
+        map(gsub("^[[:space:]]+|[[:space:]]+$"; "")) |
+        map(select(length > 0));
+      (lines($clusterRows) | map(split("|"))) as $rows |
+      {
+        cdbName: $cdbName,
+        targetContainerService: $targetContainerService,
+        startClusterId: ($rows[0][0] // ""),
+        clusters: ($rows | map(select(length == 4) | {
+          clusterId: .[1],
+          peerClusterId: (if .[2] == "" then null else .[2] end),
+          realName: .[3]
+        }) | unique_by(.clusterId) | sort_by(.clusterId)),
+        dbUniqueNames: (lines($dbUniqueNames) | unique | sort)
+      }
+    ' > "$output_file" || mf_oem_error "Unable to build the MF/OEM topology snapshot" || return 1
+
+  mf_oem_validate_topology "$output_file"
+}
+
+mf_oem_query_targets()
+{
+  local pattern="$1"
+  local member_json="${2:-null}"
   local output_file="$3"
-  local configured="${MF_OEM_REQUIRED_CDB_NAMES:-}"
+  local encoded url
 
-  if [ -z "$configured" ]
-  then
-    [ "$peer_count" = "0" ] \
-      || mf_oem_error "Peer topology exists but MF_OEM_REQUIRED_CDB_NAMES does not provide exact primary and standby OEM CDB target names" \
-      || return 1
-    configured="$primary_cdb"
-  fi
-
-  printf '%s\n' "$configured" | tr ', ' '\n\n' | sed '/^[[:space:]]*$/d' \
-    | jq -Rsc 'split("\n") | map(select(length > 0)) | unique' > "$output_file" \
-    || mf_oem_error "Unable to parse MF_OEM_REQUIRED_CDB_NAMES" || return 1
-  jq -e --arg primary "$primary_cdb" \
-    'type == "array" and length > 0 and all(type == "string" and length > 0) and index($primary) != null' \
-    "$output_file" >/dev/null \
-    || mf_oem_error "MF_OEM_REQUIRED_CDB_NAMES must include the selected primary OEM CDB target name: $primary_cdb" || return 1
-  [ "$(jq 'length' "$output_file")" -ge $((peer_count + 1)) ] \
-    || mf_oem_error "MF_OEM_REQUIRED_CDB_NAMES does not cover every repository peer target" || return 1
+  encoded=$(printf '%s' "$pattern" | mf_oem_urlencode) || return 1
+  url="${MF_OEM_API_BASE_URL}/em/api/targets?limit=100&typeName=oracle_database&typeName=oracle_pdb&nameMatches=${encoded}"
+  mf_oem_fetch_target_pages "$url" "/em/api/targets" \
+    "oracle_database,oracle_pdb" "$member_json" "$output_file"
 }
 
 mf_oem_discover_targets()
 {
-  local required_file="$1"
+  local topology_file="$1"
   local output_file="$2"
-  local cdb type pattern encoded url query_file normalized
+  local member prefix pattern query_file filtered_file normalized_file
+  local unmatched_members_file fallback_file mapped_fallback_file ambiguous_count
 
   printf '[]\n' > "$output_file" || return 1
-  while IFS= read -r cdb
+  while IFS= read -r member
   do
-    for type in oracle_database oracle_pdb
-    do
-      if [ "$type" = "oracle_database" ]
-      then
-        pattern="$cdb"
-      else
-        pattern="%${cdb}%"
-      fi
-      encoded=$(printf '%s' "$pattern" | mf_oem_urlencode) || return 1
-      url="${MF_OEM_API_BASE_URL}/em/api/targets?limit=2000&typeName=${type}&nameMatches=${encoded}"
-      mf_oem_new_temp_file query_file || return 1
-      mf_oem_fetch_target_pages "$url" "/em/api/targets" "$type" "$cdb" "$query_file" || return 1
-      mf_oem_append_json_array "$output_file" "$query_file" || return 1
-    done
-  done < <(jq -r '.[]' "$required_file")
+    prefix=$(printf '%s' "$member" | jq -r '.targetPrefix') || return 1
+    pattern="${prefix}%"
+    mf_oem_new_temp_file query_file || return 1
+    mf_oem_query_targets "$pattern" "$member" "$query_file" || return 1
+    mf_oem_new_temp_file filtered_file || return 1
+    jq --arg prefix "$prefix" '
+      ($prefix | ascii_downcase) as $expected |
+      [ .[] | select((.name | ascii_downcase) | startswith($expected)) ]
+    ' "$query_file" > "$filtered_file" || return 1
+    [ "$(jq 'length' "$filtered_file")" -eq 0 ] \
+      || mf_oem_append_json_array "$output_file" "$filtered_file" || return 1
+  done < <(jq -c '
+    .clusters[] as $cluster |
+    .dbUniqueNames[] as $dbUniqueName |
+    {
+      clusterId: $cluster.clusterId,
+      realName: $cluster.realName,
+      dbUniqueName: $dbUniqueName,
+      targetPrefix: (($cluster.realName | ascii_downcase) + "_" + $dbUniqueName),
+      discoveryMode: "target_prefix"
+    }
+  ' "$topology_file")
 
-  mf_oem_new_temp_file normalized || return 1
-  mf_oem_validate_resolved_targets "$required_file" "$output_file" "$normalized" || return 1
-  mv -f -- "$normalized" "$output_file" || return 1
+  mf_oem_new_temp_file unmatched_members_file || return 1
+  jq -n --slurpfile topology "$topology_file" --slurpfile targets "$output_file" '
+    ($targets[0] | map(.member.clusterId) | unique) as $matchedClusters |
+    [ $topology[0].clusters[] |
+      select(.clusterId as $id | ($matchedClusters | index($id)) == null) |
+      . as $cluster |
+      $topology[0].dbUniqueNames[] as $dbUniqueName |
+      {
+        clusterId: $cluster.clusterId,
+        realName: $cluster.realName,
+        dbUniqueName: $dbUniqueName,
+        targetPrefix: (($cluster.realName | ascii_downcase) + "_" + $dbUniqueName)
+      }
+    ]
+  ' > "$unmatched_members_file" || return 1
+
+  if [ "$(jq 'length' "$unmatched_members_file")" -gt 0 ]
+  then
+    pattern="%$(jq -r '.cdbName' "$topology_file")%"
+    mf_oem_new_temp_file fallback_file || return 1
+    mf_oem_query_targets "$pattern" null "$fallback_file" || return 1
+
+    ambiguous_count=$(jq -n --slurpfile candidates "$fallback_file" --slurpfile members "$unmatched_members_file" '
+      [ $candidates[0][] as $target |
+        [ $members[0][] |
+          .targetPrefix as $prefix |
+          select(($target.name | ascii_downcase) | startswith($prefix | ascii_downcase))
+        ] |
+        select(length > 1)
+      ] | length
+    ') || return 1
+    [ "$ambiguous_count" -eq 0 ] \
+      || mf_oem_error "The CDB-name fallback maps an OEM target to more than one MF member" || return 1
+
+    mf_oem_new_temp_file mapped_fallback_file || return 1
+    jq -n --slurpfile candidates "$fallback_file" --slurpfile members "$unmatched_members_file" '
+      [ $candidates[0][] as $target |
+        ([ $members[0][] |
+           .targetPrefix as $prefix |
+           select(($target.name | ascii_downcase) | startswith($prefix | ascii_downcase))
+         ]) as $matches |
+        select(($matches | length) == 1) |
+        $target + {member: ($matches[0] + {discoveryMode: "cdb_name_fallback"})}
+      ]
+    ' > "$mapped_fallback_file" || return 1
+    mf_oem_append_json_array "$output_file" "$mapped_fallback_file" || return 1
+  fi
+
+  mf_oem_new_temp_file normalized_file || return 1
+  mf_oem_validate_resolved_targets "$topology_file" "$output_file" "$normalized_file" || return 1
+  mv -f -- "$normalized_file" "$output_file" || return 1
 }
 
 mf_oem_build_payload()
@@ -614,7 +776,7 @@ mf_oem_prepare_state_file()
 mf_oem_write_state()
 {
   local migration_id="$1"
-  local required_file="$2"
+  local topology_file="$2"
   local targets_file="$3"
   local response_file="$4"
   local verified="$5"
@@ -626,7 +788,7 @@ mf_oem_write_state()
     --arg baseUrl "$MF_OEM_API_BASE_URL" \
     --arg capturedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     --argjson verified "$verified" \
-    --slurpfile required "$required_file" \
+    --slurpfile topology "$topology_file" \
     --slurpfile targets "$targets_file" \
     --slurpfile response "$response_file" '
       {
@@ -637,7 +799,7 @@ mf_oem_write_state()
         status: $response[0].status,
         capturedAt: $capturedAt,
         targetCoverageVerified: $verified,
-        requiredCdbNames: $required[0],
+        requiredTopology: $topology[0],
         targets: $targets[0]
       }
     ' > "$tmp_file" || return 1
@@ -688,10 +850,11 @@ mf_oem_verify_blackout_targets()
 mf_oem_start_blackout()
 {
   local migration_id="$1"
-  local primary_cdb="$2"
-  local peer_count="$3"
-  local time_to_end="$4"
-  local required_file targets_file payload_file response_file blackout_id
+  local repository_migration_id="$2"
+  local cdb_name="$3"
+  local target_container_service="$4"
+  local time_to_end="$5"
+  local topology_file targets_file payload_file response_file blackout_id
   local active_file active_rc active_status
 
   umask 077
@@ -711,13 +874,14 @@ mf_oem_start_blackout()
     *) return 1 ;;
   esac
   mf_oem_prepare_state_file "$migration_id" || return 1
-  mf_oem_new_temp_file required_file || return 1
+  mf_oem_new_temp_file topology_file || return 1
   mf_oem_new_temp_file targets_file || return 1
   mf_oem_new_temp_file payload_file || return 1
   mf_oem_new_temp_file response_file || return 1
 
-  mf_oem_parse_required_cdb_names "$primary_cdb" "$peer_count" "$required_file" || return 1
-  mf_oem_discover_targets "$required_file" "$targets_file" || return 1
+  mf_oem_resolve_topology "$repository_migration_id" "$cdb_name" \
+    "$target_container_service" "$topology_file" || return 1
+  mf_oem_discover_targets "$topology_file" "$targets_file" || return 1
   mf_oem_build_payload "$migration_id" "$targets_file" "$time_to_end" "$payload_file" || return 1
   # A network failure after this point is ambiguous: OEM may have created the
   # blackout even when curl did not receive a response. The caller must not
@@ -730,16 +894,16 @@ mf_oem_start_blackout()
   [[ "$blackout_id" =~ ^[A-Za-z0-9._-]+$ ]] \
     || mf_oem_error "OEM returned an unsafe blackout ID" || return 1
 
-  mf_oem_write_state "$migration_id" "$required_file" "$targets_file" "$response_file" false || return 1
+  mf_oem_write_state "$migration_id" "$topology_file" "$targets_file" "$response_file" false || return 1
   mf_oem_wait_for_started "$blackout_id" "$response_file" || {
-    mf_oem_write_state "$migration_id" "$required_file" "$targets_file" "$response_file" false >/dev/null 2>&1 || :
+    mf_oem_write_state "$migration_id" "$topology_file" "$targets_file" "$response_file" false >/dev/null 2>&1 || :
     return 1
   }
   mf_oem_verify_blackout_targets "$blackout_id" "$targets_file" || {
-    mf_oem_write_state "$migration_id" "$required_file" "$targets_file" "$response_file" false >/dev/null 2>&1 || :
+    mf_oem_write_state "$migration_id" "$topology_file" "$targets_file" "$response_file" false >/dev/null 2>&1 || :
     return 1
   }
-  mf_oem_write_state "$migration_id" "$required_file" "$targets_file" "$response_file" true || return 1
+  mf_oem_write_state "$migration_id" "$topology_file" "$targets_file" "$response_file" true || return 1
 
   printf 'OEM blackout ID       : %s\n' "$blackout_id"
   printf 'OEM blackout status   : STARTED\n'

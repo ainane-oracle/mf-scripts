@@ -475,41 +475,6 @@ touch $TMPFILE
     trap mf_oem_cleanup EXIT
     case "$ACTION" in
       START)
-        # TARGET_CLUSTERS identifies peer clusters, but not the peer database's
-        # OEM target name. Exact primary/standby names remain deployment input.
-        PEER_COUNT=$(exec_sql "$MF_REPO_CONNECT" "
-                                          with attempt_cluster as
-                                          (
-                                            select prj_name, tclu_id
-                                            from migration_attempts
-                                            where mig_id = $MFAUTO_MIG_ID
-                                          ), peers as
-                                          (
-                                            select tc.peer_tclu_id peer_tclu_id
-                                            from target_clusters tc
-                                            join attempt_cluster ac
-                                              on ac.prj_name = tc.prj_name
-                                             and ac.tclu_id = tc.tclu_id
-                                            where tc.peer_tclu_id is not null
-                                            union
-                                            select tc.tclu_id peer_tclu_id
-                                            from target_clusters tc
-                                            join attempt_cluster ac
-                                              on ac.prj_name = tc.prj_name
-                                             and tc.peer_tclu_id = ac.tclu_id
-                                          )
-                                          select to_char(count(distinct peer_tclu_id))
-                                          from peers;")
-        PEER_COUNT=$(echo "${PEER_COUNT:-0}" | tr -d '[:space:]')
-        if ! [[ "$PEER_COUNT" =~ ^[0-9]+$ ]]
-        then
-          echo "WARNING: OEM REST peer topology is unavailable; falling back to local emctl"
-          USE_REST_API=N
-        elif [ "$PEER_COUNT" = "0" ]
-        then
-          infoAction "No repository peer detected; REST will select the configured primary only" "$I1"
-        fi
-
         if [ "$USE_REST_API" = "Y" ]
         then
           [ "$DURATION_EXPLICIT" = "N" ] \
@@ -555,8 +520,8 @@ touch $TMPFILE
             infoAction "OEM blackout timeToEnd (furthest current planned go-live + 12 hours): $TIME_TO_END" "$I1"
           fi
 
-          PRIMARY_OEM_CDB_NAME=${MF_OEM_PRIMARY_CDB_NAME:-$CDB_NAME}
-          if ! mf_oem_start_blackout "$MF_MIGRATION_ID" "$PRIMARY_OEM_CDB_NAME" "$PEER_COUNT" "$TIME_TO_END"
+          if ! mf_oem_start_blackout "$MF_MIGRATION_ID" "$MFAUTO_MIG_ID" "$CDB_NAME" \
+               "$TARGETCONTAINERDATABASE_CONNECTIONDETAILS_SERVICENAME" "$TIME_TO_END"
           then
             if [ "${MF_OEM_START_MUTATION_ATTEMPTED:-N}" = "Y" ]
             then
