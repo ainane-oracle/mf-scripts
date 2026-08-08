@@ -568,8 +568,7 @@ mf_oem_filter_targets_by_topology()
         ([ $required.clusters[] as $cluster |
            (($cluster.realName | ascii_downcase) + "_" +
             ($required.cdbName | ascii_downcase)) as $prefix |
-           ($target.name | ascii_downcase) as $targetName |
-           select(($targetName == $prefix) or ($targetName | startswith($prefix + "_"))) |
+           select(($target.name | ascii_downcase) | startswith($prefix)) |
            {
              clusterId: $cluster.clusterId,
              realName: $cluster.realName
@@ -584,7 +583,7 @@ mf_oem_filter_targets_by_topology()
         ],
         ambiguousTargetCount: ([ $targetMappings[] | select((.matches | length) > 1) ] | length)
       }
-    ' > "$output_file" || mf_oem_error "Unable to filter OEM targets by exact MF cluster/CDB prefix"
+    ' > "$output_file" || mf_oem_error "Unable to filter OEM targets by CDB name and MF clusters"
 }
 
 mf_oem_validate_resolved_targets()
@@ -610,9 +609,8 @@ mf_oem_validate_resolved_targets()
       .name, .typeName, .member.clusterId, .member.realName
     ]) | unique | length) == 1)) and
     ($resolved | all(. as $target |
-      (($target.member.realName | ascii_downcase) + "_" + $cdbName) as $prefix |
-      ($target.name | ascii_downcase) as $targetName |
-      (($targetName == $prefix) or ($targetName | startswith($prefix + "_"))) and
+      (($target.name | ascii_downcase) |
+        startswith(($target.member.realName | ascii_downcase) + "_" + $cdbName)) and
       ([ $required.clusters[] |
          select(.clusterId == $target.member.clusterId and
                  (.realName | ascii_downcase) == ($target.member.realName | ascii_downcase))

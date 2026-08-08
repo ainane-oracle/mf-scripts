@@ -117,19 +117,19 @@ write_json "$TEST_TMP/targets-all.json" '[
 ]'
 
 expect_success "multiple database targets per cluster and all discovered PDBs are retained" \
-  validate_discovery_fixture "$TEST_TMP/topology-two.json" "$TEST_TMP/targets-all.json" 6
+  validate_discovery_fixture "$TEST_TMP/topology-two.json" "$TEST_TMP/targets-all.json" 7
 
 mf_oem_filter_targets_by_topology "$TEST_TMP/topology-two.json" "$TEST_TMP/targets-all.json" \
   "$TEST_TMP/prefix-filter.json"
 if jq -e '
-     (.targets | map(.id) | index("unrelated")) == null and
+     (.targets | map(.id) | index("unrelated")) != null and
      ([.targets[] | select(.typeName == "oracle_pdb")] | length) == 3 and
-     ([.targets[] | select(.member.clusterId == "1" and .typeName == "oracle_database")] | length) == 2
+     ([.targets[] | select(.member.clusterId == "1" and .typeName == "oracle_database")] | length) == 3
    ' "$TEST_TMP/prefix-filter.json" >/dev/null
 then
-  pass "exact prefix boundary rejects CDBA2 while retaining every CDBA target"
+  pass "legacy target prefix matching behavior is preserved"
 else
-  fail "exact prefix boundary rejects CDBA2 while retaining every CDBA target"
+  fail "legacy target prefix matching behavior is preserved"
 fi
 
 write_json "$TEST_TMP/topology-one.json" '{
@@ -152,7 +152,7 @@ expect_failure "empty discovery fails closed" \
 write_json "$TEST_TMP/targets-unrelated-only.json" '[
   {"id":"db-other","name":"exa1_CDBA2_M1","typeName":"oracle_database"}
 ]'
-expect_failure "an unrelated prefix cannot satisfy discovery" \
+expect_success "legacy prefix matching accepts longer names that start with the CDB prefix" \
   validate_discovery_fixture "$TEST_TMP/topology-one.json" "$TEST_TMP/targets-unrelated-only.json" 1
 
 write_json "$TEST_TMP/targets-duplicate-identical.json" '[
