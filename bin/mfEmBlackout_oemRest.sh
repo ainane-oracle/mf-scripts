@@ -340,7 +340,7 @@ mf_oem_find_exact_blackouts()
   if [ "$suffixed_count" -gt 0 ]
   then
     mf_oem_warning "Ignoring $suffixed_count blackout definition(s) with a suffixed name; expected name is $blackout_name"
-    jq -r '.[] | "Ignored blackout ID \(.id), name \(.name), status \(.status)"' \
+    jq -r '.[] | "Ignored timestamp-suffixed blackout: id=\(.id), name=\(.name), status=\(.status)"' \
       "$suffixed_file" | while IFS= read -r message
       do
         mf_oem_warning "$message"
@@ -488,10 +488,15 @@ mf_oem_print_inspection()
     (if $inspection.candidateCount == 1 then "Blackout status        : \($inspection.status)" else empty end),
     ("Target coverage       : \($inspection.expectedTargets | length) discovered targets" +
       (if $inspection.candidateCount == 1
-       then (if $inspection.terminal then "; not checked during terminal cleanup" elif $inspection.exactTargetIds then "; complete" else "; incomplete" end)
+       then (if $inspection.terminal
+             then "; coverage was not checked during terminal cleanup"
+             elif $inspection.exactTargetIds
+             then "; all discovered targets are covered"
+             else "; not all discovered targets are covered"
+             end)
        else ""
        end))
-  ' "$inspection_file" || mf_oem_error "Unable to format OEM blackout status"
+  ' "$inspection_file" | sed 's/^/      /' || mf_oem_error "Unable to format OEM blackout status"
 }
 
 mf_oem_validate_topology()
@@ -930,9 +935,9 @@ mf_oem_start_blackout()
         then
           if [ "$status" = "SCHEDULED" ]
           then
-            mf_oem_log 'START accepted as SCHEDULED with complete target coverage; ON is not yet confirmed.'
+            mf_oem_log 'START accepted as SCHEDULED; all discovered targets are covered, but ON is not yet confirmed.'
           else
-            mf_oem_log 'Blackout is already STARTED with complete target coverage; no new blackout was created.'
+            mf_oem_log 'Blackout is already STARTED with all discovered targets covered; no new blackout was created.'
           fi
           return 0
         fi
@@ -1049,10 +1054,10 @@ mf_oem_is_blackout_on()
        .exactTargetIds
      ' "$inspection_file" >/dev/null
   then
-    printf 'OEM blackout has complete discovered target coverage and is ON.\n'
+    printf '      Blackout is ON; all discovered targets are covered.\n'
     return 0
   fi
-  printf 'OEM blackout is not fully ON for the complete discovered target set.\n'
+  printf '      Blackout is not ON for all discovered targets.\n'
   return 3
 }
 
