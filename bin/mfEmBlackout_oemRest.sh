@@ -628,13 +628,44 @@ mf_oem_validate_topology()
     || mf_oem_error "MF cluster topology and Data Guard members are missing, stale, or inconsistent"
 }
 
+mf_oem_validate_cluster_topology()
+{
+  local topology_file="$1"
+  jq -e '
+    def db_name_from_unique_name:
+      if contains("_") then split("_")[0]
+      elif test("^C.*M[0-9]*$") then sub("M[0-9]*$"; "")
+      else . end;
+    . as $topology |
+    ($topology.targetContainerService) as $selectedService |
+    ($topology.cdbName | ascii_downcase) as $cdbName |
+    ($topology | type == "object") and
+    ($topology.cdbName | type == "string" and length > 0) and
+    ($topology.targetContainerService | type == "string" and length > 0) and
+    ($topology.startClusterId | type == "string" and length > 0) and
+    ($topology.clusters | type == "array" and length > 0 and all(
+      type == "object" and
+      (.clusterId | type == "string" and length > 0) and
+      ((.peerClusterId == null) or (.peerClusterId | type == "string" and length > 0)) and
+      (.realName | type == "string" and length > 0)
+    )) and
+    ($topology.clusters | map(.clusterId) | unique | length) == ($topology.clusters | length) and
+    ($topology.clusters | map(.realName | ascii_downcase) | unique | length) == ($topology.clusters | length) and
+    ($topology.clusters | map(.clusterId) | index($topology.startClusterId)) != null and
+    ($topology.clusters | all(.peerClusterId == null or
+      (.peerClusterId as $peer | [$topology.clusters[].clusterId] | index($peer)) != null)) and
+    (($selectedService | db_name_from_unique_name | ascii_downcase) == $cdbName)
+  ' "$topology_file" >/dev/null 2>&1 \
+    || mf_oem_error "MF cluster topology and selected target service are missing, stale, or inconsistent"
+}
+
 mf_oem_resolve_topology()
 {
   local repository_migration_id="$1"
   local cdb_name="$2"
   local target_container_service="$3"
   local output_file="$4"
-  local cluster_rows db_unique_names
+  local cluster_rows
 
   [[ "$repository_migration_id" =~ ^[0-9]+$ ]] \
     || mf_oem_error "The internal MF migration ID must be numeric" || return 1
@@ -653,15 +684,8 @@ mf_oem_resolve_topology()
        and (prior tc.tclu_id = tc.peer_tclu_id or prior tc.peer_tclu_id = tc.tclu_id);") \
     || mf_oem_error "Unable to resolve the connected MF target clusters" || return 1
 
-  db_unique_names=$(exec_sql "$MF_TGT_CDB_CONNECT" "
-    select db_unique_name from v\$database
-    union
-    select db_unique_name from v\$dataguard_config;") \
-    || mf_oem_error "Unable to resolve Data Guard DB_UNIQUE_NAME members" || return 1
-
   jq -n \
     --arg clusterRows "$cluster_rows" \
-    --arg dbUniqueNames "$db_unique_names" \
     --arg cdbName "$cdb_name" \
     --arg targetContainerService "$target_container_service" '
       def lines($value):
@@ -678,11 +702,11 @@ mf_oem_resolve_topology()
           peerClusterId: (if .[2] == "" then null else .[2] end),
           realName: .[3]
         }) | unique_by(.clusterId) | sort_by(.clusterId)),
-        dbUniqueNames: (lines($dbUniqueNames) | unique | sort)
+        dbUniqueNames: [$targetContainerService]
       }
     ' > "$output_file" || mf_oem_error "Unable to build the MF/OEM topology snapshot" || return 1
 
-  mf_oem_validate_topology "$output_file"
+  mf_oem_validate_cluster_topology "$output_file"
 }
 
 mf_oem_query_targets()
@@ -698,89 +722,114 @@ mf_oem_query_targets()
     "oracle_database,oracle_pdb" "$member_json" "$output_file"
 }
 
+mf_oem_resolve_targets_from_candidates()
+{
+  local topology_file="$1"
+  local candidates_file="$2"
+  local discovery_mode="$3"
+  local output_file="$4"
+
+  jq -n \
+    --arg discoveryMode "$discovery_mode" \
+    --slurpfile topology "$topology_file" \
+    --slurpfile candidates "$candidates_file" '
+      def db_name_from_unique_name:
+        if contains("_") then split("_")[0]
+        elif test("^C.*M[0-9]*$") then sub("M[0-9]*$"; "")
+        else . end;
+      $topology[0] as $required |
+      [ $required.clusters[] as $cluster |
+        (($cluster.realName | ascii_downcase) + "_") as $clusterPrefix |
+        ([ $candidates[0][] as $databaseTarget |
+           select($databaseTarget.typeName == "oracle_database") |
+           select(($databaseTarget.name | ascii_downcase) | startswith($clusterPrefix)) |
+           ($databaseTarget.name[($clusterPrefix | length):]) as $dbUniqueName |
+           select(($dbUniqueName | db_name_from_unique_name | ascii_downcase) ==
+                  ($required.cdbName | ascii_downcase)) |
+           {
+             clusterId: $cluster.clusterId,
+             realName: $cluster.realName,
+             dbUniqueName: $dbUniqueName,
+             targetPrefix: $databaseTarget.name,
+             discoveryMode: $discoveryMode
+           }
+         ]) as $matches |
+        {clusterId: $cluster.clusterId, candidateCount: ($matches | length), matches: $matches}
+      ] as $clusterCandidates |
+      [ $clusterCandidates[] | select(.candidateCount == 1) | .matches[0] ] as $members |
+      [ $candidates[0][] as $target |
+        ([ $members[] |
+           .targetPrefix as $prefix |
+           select(($target.name | ascii_downcase) | startswith($prefix | ascii_downcase))
+         ]) as $matches |
+        {target: $target, matches: $matches}
+      ] as $targetMappings |
+      {
+        topology: ($required + {
+          dbUniqueNames: ($members | map(.dbUniqueName) | unique | sort)
+        }),
+        targets: [ $targetMappings[] |
+          select((.matches | length) == 1) |
+          .target + {member: .matches[0]}
+        ],
+        clusterCandidateCounts: ($clusterCandidates | map({clusterId, candidateCount})),
+        ambiguousTargetCount: ([ $targetMappings[] | select((.matches | length) > 1) ] | length)
+      }
+    ' > "$output_file" || mf_oem_error "Unable to map OEM targets to MF clusters"
+}
+
 mf_oem_discover_targets()
 {
   local topology_file="$1"
   local output_file="$2"
-  local member prefix pattern query_file filtered_file normalized_file
-  local unmatched_members_file fallback_file mapped_fallback_file ambiguous_count
+  local pattern discovery_mode cluster_count prefix candidate_count
+  local query_file resolution_file resolved_topology_file resolved_targets_file normalized_file
 
-  printf '[]\n' > "$output_file" || return 1
-  while IFS= read -r member
-  do
-    prefix=$(printf '%s' "$member" | jq -r '.targetPrefix') || return 1
-    pattern="${prefix}%"
-    mf_oem_new_temp_file query_file || return 1
-    mf_oem_query_targets "$pattern" "$member" "$query_file" || return 1
-    mf_oem_new_temp_file filtered_file || return 1
-    jq --arg prefix "$prefix" '
-      ($prefix | ascii_downcase) as $expected |
-      [ .[] | select((.name | ascii_downcase) | startswith($expected)) ]
-    ' "$query_file" > "$filtered_file" || return 1
-    [ "$(jq 'length' "$filtered_file")" -eq 0 ] \
-      || mf_oem_append_json_array "$output_file" "$filtered_file" || return 1
-  done < <(jq -c '
-    .clusters[] as $cluster |
-    .dbUniqueNames[] as $dbUniqueName |
-    {
-      clusterId: $cluster.clusterId,
-      realName: $cluster.realName,
-      dbUniqueName: $dbUniqueName,
-      targetPrefix: (($cluster.realName | ascii_downcase) + "_" + $dbUniqueName),
-      discoveryMode: "target_prefix"
-    }
-  ' "$topology_file")
-
-  mf_oem_new_temp_file unmatched_members_file || return 1
-  jq -n --slurpfile topology "$topology_file" --slurpfile targets "$output_file" '
-    ($targets[0] | map(.member.clusterId) | unique) as $matchedClusters |
-    [ $topology[0].clusters[] |
-      select(.clusterId as $id | ($matchedClusters | index($id)) == null) |
-      . as $cluster |
-      $topology[0].dbUniqueNames[] as $dbUniqueName |
-      {
-        clusterId: $cluster.clusterId,
-        realName: $cluster.realName,
-        dbUniqueName: $dbUniqueName,
-        targetPrefix: (($cluster.realName | ascii_downcase) + "_" + $dbUniqueName)
-      }
-    ]
-  ' > "$unmatched_members_file" || return 1
-
-  if [ "$(jq 'length' "$unmatched_members_file")" -gt 0 ]
+  cluster_count=$(jq -r '.clusters | length' "$topology_file") || return 1
+  if [ "$cluster_count" -eq 1 ]
   then
+    prefix=$(jq -r '(.clusters[0].realName | ascii_downcase) + "_" + .targetContainerService' \
+      "$topology_file") || return 1
+    pattern="${prefix}%"
+    discovery_mode=target_prefix
+  else
     pattern="%$(jq -r '.cdbName' "$topology_file")%"
-    mf_oem_new_temp_file fallback_file || return 1
-    mf_oem_query_targets "$pattern" null "$fallback_file" || return 1
-
-    ambiguous_count=$(jq -n --slurpfile candidates "$fallback_file" --slurpfile members "$unmatched_members_file" '
-      [ $candidates[0][] as $target |
-        [ $members[0][] |
-          .targetPrefix as $prefix |
-          select(($target.name | ascii_downcase) | startswith($prefix | ascii_downcase))
-        ] |
-        select(length > 1)
-      ] | length
-    ') || return 1
-    [ "$ambiguous_count" -eq 0 ] \
-      || mf_oem_error "The CDB-name fallback maps an OEM target to more than one MF member" || return 1
-
-    mf_oem_new_temp_file mapped_fallback_file || return 1
-    jq -n --slurpfile candidates "$fallback_file" --slurpfile members "$unmatched_members_file" '
-      [ $candidates[0][] as $target |
-        ([ $members[0][] |
-           .targetPrefix as $prefix |
-           select(($target.name | ascii_downcase) | startswith($prefix | ascii_downcase))
-         ]) as $matches |
-        select(($matches | length) == 1) |
-        $target + {member: ($matches[0] + {discoveryMode: "cdb_name_fallback"})}
-      ]
-    ' > "$mapped_fallback_file" || return 1
-    mf_oem_append_json_array "$output_file" "$mapped_fallback_file" || return 1
+    discovery_mode=cdb_name_fallback
   fi
 
+  mf_oem_new_temp_file query_file || return 1
+  mf_oem_query_targets "$pattern" null "$query_file" || return 1
+  candidate_count=$(jq 'length' "$query_file") || return 1
+
+  if [ "$candidate_count" -eq 0 ] && [ "$discovery_mode" = "target_prefix" ]
+  then
+    pattern="%$(jq -r '.cdbName' "$topology_file")%"
+    discovery_mode=cdb_name_fallback
+    mf_oem_query_targets "$pattern" null "$query_file" || return 1
+  fi
+
+  mf_oem_new_temp_file resolution_file || return 1
+  mf_oem_resolve_targets_from_candidates "$topology_file" "$query_file" \
+    "$discovery_mode" "$resolution_file" || return 1
+
+  jq -e --argjson clusterCount "$cluster_count" '
+    (.clusterCandidateCounts | length) == $clusterCount and
+    (.clusterCandidateCounts | all(.candidateCount == 1)) and
+    .ambiguousTargetCount == 0
+  ' "$resolution_file" >/dev/null 2>&1 \
+    || mf_oem_error "OEM target names do not resolve exactly one CDB target per MF cluster" || return 1
+
+  mf_oem_new_temp_file resolved_topology_file || return 1
+  jq '.topology' "$resolution_file" > "$resolved_topology_file" || return 1
+  mf_oem_validate_topology "$resolved_topology_file" || return 1
+
+  mf_oem_new_temp_file resolved_targets_file || return 1
+  jq '.targets' "$resolution_file" > "$resolved_targets_file" || return 1
   mf_oem_new_temp_file normalized_file || return 1
-  mf_oem_validate_resolved_targets "$topology_file" "$output_file" "$normalized_file" || return 1
+  mf_oem_validate_resolved_targets "$resolved_topology_file" "$resolved_targets_file" \
+    "$normalized_file" || return 1
+
+  mv -f -- "$resolved_topology_file" "$topology_file" || return 1
   mv -f -- "$normalized_file" "$output_file" || return 1
 }
 
