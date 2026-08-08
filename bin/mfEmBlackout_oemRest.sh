@@ -787,7 +787,7 @@ mf_oem_status_result()
 {
   case "$1" in
     STARTED) return 0 ;;
-    START_PROCESSING) return 2 ;;
+    SCHEDULED|START_PROCESSING) return 2 ;;
     START_PARTIAL|START_FAILED) mf_oem_error "OEM blackout returned terminal status $1" ;;
     *) mf_oem_error "OEM blackout returned unexpected status $1" ;;
   esac
@@ -847,6 +847,19 @@ mf_oem_wait_for_stopped()
     attempt=$((attempt + 1))
   done
   mf_oem_error "OEM blackout did not reach STOPPED within the verification window"
+}
+
+mf_oem_delete_blackout()
+{
+  local blackout_id="$1"
+  local response_file
+
+  [[ "$blackout_id" =~ ^[A-Za-z0-9._-]+$ ]] \
+    || mf_oem_error "OEM returned an unsafe blackout ID" || return 1
+  mf_oem_new_temp_file response_file || return 1
+  mf_oem_http DELETE "${MF_OEM_API_BASE_URL}/em/api/blackouts/${blackout_id}" "$response_file" || return 1
+  mf_oem_expect_http "$MF_OEM_HTTP_STATUS" 204 "Blackout deletion" || return 1
+  printf 'OEM blackout deleted  : %s\n' "$blackout_id"
 }
 
 mf_oem_prepare_state_file()
@@ -1114,8 +1127,6 @@ mf_oem_stop_blackout()
       MF_OEM_STOP_MUTATION_ATTEMPTED=Y
       ;;
     STOPPED|ENDED)
-      mf_oem_print_blackout "$response_file"
-      return 0
       ;;
     *)
       mf_oem_error "Canonical OEM blackout changed to non-stoppable status $status"
@@ -1125,4 +1136,8 @@ mf_oem_stop_blackout()
 
   mf_oem_wait_for_stopped "$blackout_id" "$response_file" || return 1
   mf_oem_print_blackout "$response_file"
+  # OEM keeps stopped blackout resources. Remove the terminal canonical record
+  # so the next START can reuse the fixed Migration Factory blackout name.
+  MF_OEM_STOP_MUTATION_ATTEMPTED=Y
+  mf_oem_delete_blackout "$blackout_id"
 }

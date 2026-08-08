@@ -107,7 +107,7 @@ one_member='{"clusterId":"1","realName":"exa1","dbUniqueName":"CDBA_M1","targetP
 
 expect_failure "zero targets fails closed" validate_fixture "$one_topology" '[]' zero
 
-expect_failure "database-only discovery cannot satisfy the REST DB and PDB requirement" validate_fixture \
+expect_success "database-only discovery is valid when OEM has no PDB target" validate_fixture \
   "$one_topology" \
   '[{"id":"cdb-a","name":"exa1_CDBA_M1","typeName":"oracle_database","member":{"clusterId":"1","realName":"exa1","dbUniqueName":"CDBA_M1","targetPrefix":"exa1_CDBA_M1","discoveryMode":"target_prefix"}}]' db_only
 
@@ -135,8 +135,51 @@ expect_failure "unexpected target type fails closed" validate_fixture \
   '[{"id":"host-a","name":"exa1_CDBA_M1","typeName":"host","member":{"clusterId":"1","realName":"exa1","dbUniqueName":"CDBA_M1","targetPrefix":"exa1_CDBA_M1","discoveryMode":"target_prefix"}}]' unexpected_type
 
 expect_success "consistent topology is accepted" mf_oem_validate_topology "$TEST_TMP/success_peer.required.json"
-write_json "$TEST_TMP/topology-count-mismatch.json" '{"cdbName":"CDBA","targetContainerService":"CDBA_M1","startClusterId":"1","clusters":[{"clusterId":"1","peerClusterId":null,"realName":"exa1"},{"clusterId":"2","peerClusterId":"1","realName":"exa2"}],"dbUniqueNames":["CDBA_M1"]}'
-expect_failure "MF and Data Guard member count mismatch fails REST validation" mf_oem_validate_topology "$TEST_TMP/topology-count-mismatch.json"
+write_json "$TEST_TMP/mf-topology.json" '{"cdbName":"CDBA","targetContainerService":"CDBA_M1","startClusterId":"1","clusters":[{"clusterId":"1","peerClusterId":null,"realName":"exa1"},{"clusterId":"2","peerClusterId":"1","realName":"exa2"}]}'
+expect_success "MF topology does not require peer DB_UNIQUE_NAME values" \
+  mf_oem_validate_topology "$TEST_TMP/mf-topology.json"
+
+write_json "$TEST_TMP/oem-name-candidates.json" '[
+  {"id":"cdb-1","name":"exa1_CDBA_M1","typeName":"oracle_database"},
+  {"id":"cdb-1-instance-2","name":"exa1_CDBA_M1_2","typeName":"oracle_database"},
+  {"id":"pdb-1","name":"exa1_CDBA_M1_APP","typeName":"oracle_pdb"},
+  {"id":"cdb-2","name":"exa2_CDBA_M2","typeName":"oracle_database"},
+  {"id":"cdb-2-instance-2","name":"exa2_CDBA_M2_2","typeName":"oracle_database"},
+  {"id":"pdb-2","name":"exa2_CDBA_M2_APP","typeName":"oracle_pdb"},
+  {"id":"cdb-3","name":"exa3_CDBA_M3","typeName":"oracle_database"},
+  {"id":"pdb-3","name":"exa3_CDBA_M3_APP","typeName":"oracle_pdb"},
+  {"id":"other","name":"exa1_OTHER_M1","typeName":"oracle_database"}
+]'
+if mf_oem_filter_targets_by_topology "$TEST_TMP/success_peer.required.json" \
+     "$TEST_TMP/oem-name-candidates.json" "$TEST_TMP/oem-name-resolution.json" \
+   && jq -e '
+        .ambiguousTargetCount == 0 and
+        (.targets | length) == 8 and
+        (.targets | all(.member.discoveryMode == "cdb_name")) and
+        ([.targets[] | select(.member.clusterId == "1" and .typeName == "oracle_database")] | length) == 2
+      ' "$TEST_TMP/oem-name-resolution.json" >/dev/null
+then
+  pass "all matching database instances and PDB targets are retained"
+else
+  fail "all matching database instances and PDB targets are retained"
+fi
+
+cp "$TEST_TMP/mf-topology.json" "$TEST_TMP/discovery-topology.json"
+mf_oem_query_targets()
+{
+  cp "$TEST_TMP/oem-name-candidates.json" "$3"
+}
+MF_OEM_TMP_FILES=()
+if mf_oem_discover_targets "$TEST_TMP/discovery-topology.json" "$TEST_TMP/discovered-targets.json" \
+   && [ "$(jq 'length' "$TEST_TMP/discovered-targets.json")" = "6" ] \
+   && [ "$(jq '[.[] | select(.typeName == "oracle_database")] | length' \
+        "$TEST_TMP/discovered-targets.json")" = "4" ]
+then
+  pass "target discovery keeps every matching database instance and PDB across MF clusters"
+else
+  fail "target discovery keeps every matching database instance and PDB across MF clusters"
+fi
+unset -f mf_oem_query_targets
 
 write_json "$TEST_TMP/malformed.json" '{not-json'
 expect_failure "malformed JSON response fails closed" mf_oem_validate_collection_page "$TEST_TMP/malformed.json"
@@ -147,8 +190,11 @@ do
 done
 expect_success "HTTP 200 is accepted for GET" mf_oem_expect_http 200 200 "test request"
 expect_success "HTTP 201 is accepted for POST" mf_oem_expect_http 201 201 "test request"
+expect_success "HTTP 204 is accepted for DELETE" mf_oem_expect_http 204 204 "test request"
 
 expect_success "STARTED is success" mf_oem_status_result STARTED
+expect_return "SCHEDULED remains in progress" 2 mf_oem_status_result SCHEDULED
+expect_return "START_PROCESSING remains in progress" 2 mf_oem_status_result START_PROCESSING
 expect_failure "START_PARTIAL is failure" mf_oem_status_result START_PARTIAL
 expect_failure "START_FAILED is failure" mf_oem_status_result START_FAILED
 expect_success "STOPPED is a completed stop" mf_oem_stop_status_result STOPPED
@@ -398,13 +444,29 @@ else
   fail "semantic REST results do not trigger the temporary emctl fallback"
 fi
 
+if grep -F 'mf_oem_http DELETE "${MF_OEM_API_BASE_URL}/em/api/blackouts/${blackout_id}"' \
+     "$SCRIPT_DIR/mfEmBlackout_oemRest.sh" >/dev/null \
+   && grep -F 'mf_oem_expect_http "$MF_OEM_HTTP_STATUS" 204 "Blackout deletion"' \
+        "$SCRIPT_DIR/mfEmBlackout_oemRest.sh" >/dev/null \
+   && grep -F 'mf_oem_delete_blackout "$blackout_id"' \
+        "$SCRIPT_DIR/mfEmBlackout_oemRest.sh" >/dev/null
+then
+  pass "REST STOP deletes the terminal canonical blackout"
+else
+  fail "REST STOP deletes the terminal canonical blackout"
+fi
+
 if grep -F 'limit=100&typeName=oracle_database&typeName=oracle_pdb&nameMatches=${encoded}' \
      "$SCRIPT_DIR/mfEmBlackout_oemRest.sh" >/dev/null \
-   && grep -F 'discoveryMode: "cdb_name_fallback"' "$SCRIPT_DIR/mfEmBlackout_oemRest.sh" >/dev/null
+   && grep -F 'pattern="%$(jq -r '\''.cdbName'\'' "$topology_file")%"' \
+        "$SCRIPT_DIR/mfEmBlackout_oemRest.sh" >/dev/null \
+   && ! grep -F 'v\$dataguard_config' "$SCRIPT_DIR/mfEmBlackout_oemRest.sh" >/dev/null \
+   && ! grep -F 'MF_TGT_CDB_CONNECT' "$SCRIPT_DIR/mfEmBlackout_oemRest.sh" >/dev/null \
+   && ! grep -F 'candidateCount == 1' "$SCRIPT_DIR/mfEmBlackout_oemRest.sh" >/dev/null
 then
-  pass "OEM 13.5 target discovery uses one repeated-typeName call and a CDB-name fallback"
+  pass "OEM 13.5 discovery searches by CDB_NAME and keeps all matching database and PDB targets"
 else
-  fail "OEM 13.5 target discovery uses one repeated-typeName call and a CDB-name fallback"
+  fail "OEM 13.5 discovery searches by CDB_NAME and keeps all matching database and PDB targets"
 fi
 
 apex_sources=(
@@ -481,6 +543,30 @@ else
   fail "all advertised pagination pages are processed"
 fi
 unset -f curl
+
+mf_oem_new_temp_file()
+{
+  printf -v "$1" '%s' "$TEST_TMP/delete-response.json"
+}
+mf_oem_http()
+{
+  [ "$1" = "DELETE" ] \
+    && [ "$2" = "https://oms.example:7803/em/api/blackouts/BLACKOUT-1" ] \
+    && [ "$3" = "$TEST_TMP/delete-response.json" ] || return 1
+  MF_OEM_HTTP_STATUS=204
+  : > "$3"
+}
+mf_oem_expect_http()
+{
+  [ "$1" = "204" ] && [ "$2" = "204" ] && [ "$3" = "Blackout deletion" ]
+}
+if mf_oem_delete_blackout BLACKOUT-1 >/dev/null
+then
+  pass "REST STOP deletion uses the terminal blackout ID and requires HTTP 204"
+else
+  fail "REST STOP deletion uses the terminal blackout ID and requires HTTP 204"
+fi
+
 mf_oem_cleanup
 
 printf 'tests: %s passed, %s failed\n' "$PASS" "$FAIL"
