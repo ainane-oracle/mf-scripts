@@ -286,6 +286,17 @@ else
   fail "one exact-name ID uses target-ID equality without repeated name/type comparison"
 fi
 
+if mf_oem_print_inspection "$TEST_TMP/inspection-one.json" > "$TEST_TMP/inspection-output.txt" \
+   && grep -F 'oracle_database       : 1 discovered' "$TEST_TMP/inspection-output.txt" >/dev/null \
+   && grep -F 'oracle_pdb (optional) : 1 discovered; every discovered PDB is required' \
+        "$TEST_TMP/inspection-output.txt" >/dev/null \
+   && grep -F 'Discovered target IDs: COMPLETE' "$TEST_TMP/inspection-output.txt" >/dev/null
+then
+  pass "inspection output formats target counts without jq quoting errors"
+else
+  fail "inspection output formats target counts without jq quoting errors"
+fi
+
 if (
   mf_oem_get_blackout() { cp "$TEST_TMP/detail-started.json" "$2"; }
   mf_oem_fetch_blackout_targets() { cp "$TEST_TMP/actual-incomplete.json" "$2"; }
