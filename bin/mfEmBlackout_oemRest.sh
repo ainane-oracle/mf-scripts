@@ -443,18 +443,22 @@ mf_oem_print_inspection()
   local inspection_file="$1"
   jq -r --arg name "$(mf_oem_blackout_name)" '
     def count_type($items; $type): [$items[] | select(.typeName == $type)] | length;
+    . as $inspection |
+    count_type($inspection.expectedTargets; "oracle_database") as $databaseCount |
+    count_type($inspection.expectedTargets; "oracle_pdb") as $pdbCount |
+    (if $inspection.exactTargetIds then "COMPLETE" else "INCOMPLETE" end) as $coverage |
     "OEM canonical name     : \($name)",
-    "OEM exact candidates  : \(.candidateCount)",
-    (if .candidateCount == 1 then "OEM blackout ID       : \(.blackoutId)" else empty end),
-    (if .candidateCount == 1 then "OEM blackout status   : \(.status)" else empty end),
-    "Discovered targets    : \(.expectedTargets | length)",
-    "oracle_database       : \(count_type(.expectedTargets; \"oracle_database\")) discovered",
-    "oracle_pdb (optional) : \(count_type(.expectedTargets; \"oracle_pdb\")) discovered; every discovered PDB is required",
-    (if .candidateCount == 1
-     then "Discovered target IDs: \(if .exactTargetIds then \"COMPLETE\" else \"INCOMPLETE\" end)"
+    "OEM exact candidates  : \($inspection.candidateCount)",
+    (if $inspection.candidateCount == 1 then "OEM blackout ID       : \($inspection.blackoutId)" else empty end),
+    (if $inspection.candidateCount == 1 then "OEM blackout status   : \($inspection.status)" else empty end),
+    "Discovered targets    : \($inspection.expectedTargets | length)",
+    "oracle_database       : \($databaseCount) discovered",
+    "oracle_pdb (optional) : \($pdbCount) discovered; every discovered PDB is required",
+    (if $inspection.candidateCount == 1
+     then "Discovered target IDs: \($coverage)"
      else empty end),
-    (if .candidateCount > 1
-     then (.candidates[] | "Conflicting exact ID    : \(.id) [\(.status)]")
+    (if $inspection.candidateCount > 1
+     then ($inspection.candidates[] | "Conflicting exact ID    : \(.id) [\(.status)]")
      else empty end)
   ' "$inspection_file" || mf_oem_error "Unable to format OEM blackout status"
 }
