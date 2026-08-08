@@ -21,6 +21,9 @@
 #               not accept the previously used id/name sort fields. Results are
 #               validated and selected locally, so ordering is not required.
 #
+# Debug       : Set MF_OEM_DEBUG=Y for request URL, HTTP status, and response
+#               body diagnostics. Authentication headers are never printed.
+#
 # Modifications:
 # - REST support is opt-in from mfEmBlackout.sh via -r.
 # - Added exact-name lookup with a nameMatches wildcard fallback.
@@ -126,8 +129,22 @@ mf_oem_http()
     args+=(--cacert "$MF_OEM_CA_CERT")
   fi
 
+  if [ "${MF_OEM_DEBUG:-N}" = "Y" ]
+  then
+    printf 'OEM REST request: %s %s\n' "$method" "$url" >&2
+    printf 'OEM REST response file: %s\n' "$output_file" >&2
+  fi
+
   MF_OEM_HTTP_STATUS=$(mf_oem_authorization_config | curl "${args[@]}")
   MF_OEM_HTTP_RC=$?
+
+  if [ "${MF_OEM_DEBUG:-N}" = "Y" ]
+  then
+    printf 'OEM REST HTTP status: %s\n' "$MF_OEM_HTTP_STATUS" >&2
+    printf '%s\n' 'OEM REST response body:' >&2
+    jq . "$output_file" >&2 2>/dev/null || sed -n '1,120p' "$output_file" >&2
+  fi
+
   [ "$MF_OEM_HTTP_RC" -eq 0 ] || mf_oem_error "HTTPS request failed for $method $url"
 }
 
