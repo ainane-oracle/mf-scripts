@@ -29,6 +29,7 @@ MF_OEM_BLACKOUT_REASON_ID=29
 MF_OEM_BLACKOUT_ALLOW_JOBS=true
 MF_OEM_VERIFY_ATTEMPTS=1
 MF_OEM_VERIFY_INTERVAL=0
+MF_OEM_STOP_PENDING_TIMEOUT=0
 
 PASS=0
 FAIL=0
@@ -193,10 +194,6 @@ expect_return "SCHEDULED is an accepted START result" 0 mf_oem_start_status_resu
 expect_return "STARTED is an accepted START result" 0 mf_oem_start_status_result STARTED
 expect_return "START_PROCESSING remains transitional" 2 mf_oem_start_status_result START_PROCESSING
 expect_failure "START_PARTIAL is a failed START result" mf_oem_start_status_result START_PARTIAL
-expect_return "STOPPED completes STOP" 0 mf_oem_stop_status_result STOPPED
-expect_return "ENDED completes STOP" 0 mf_oem_stop_status_result ENDED
-expect_return "STOP_PENDING remains transitional" 2 mf_oem_stop_status_result STOP_PENDING
-expect_failure "STOP_PARTIAL fails STOP" mf_oem_stop_status_result STOP_PARTIAL
 
 if [ "$(mf_oem_parse_duration '12:00')" = "12|0" ] \
    && [ "$(mf_oem_parse_duration '1 02:30')" = "26|30" ]
@@ -310,6 +307,34 @@ else
   fail "singleton exact-name blackout is incomplete when any discovered PDB ID is missing"
 fi
 
+write_json "$TEST_TMP/candidate-stopped.json" '[
+  {"id":"BLACKOUT-OLD","name":"MF_2_CDBA_Migration","status":"STOPPED","type":"PATCHING","owner":"mf"}
+]'
+write_json "$TEST_TMP/detail-stopped-old.json" \
+  '{"id":"BLACKOUT-OLD","name":"MF_2_CDBA_Migration","status":"STOPPED"}'
+if (
+  mf_oem_get_blackout() { cp "$TEST_TMP/detail-stopped-old.json" "$2"; }
+  mf_oem_fetch_blackout_targets() { return 99; }
+  mf_oem_inspect_exact_blackouts "$TEST_TMP/candidate-stopped.json" "$TEST_TMP/expected.json" \
+    "$TEST_TMP/inspection-terminal.json"
+) && jq -e '
+     .candidateCount == 1 and .blackoutId == "BLACKOUT-OLD" and
+     .status == "STOPPED" and .terminal and (.exactTargetIds | not)
+   ' "$TEST_TMP/inspection-terminal.json" >/dev/null
+then
+  pass "terminal canonical blackout is rediscovered by verified ID without requiring its targets endpoint"
+else
+  fail "terminal canonical blackout is rediscovered by verified ID without requiring its targets endpoint"
+fi
+if mf_oem_print_inspection "$TEST_TMP/inspection-terminal.json" > "$TEST_TMP/terminal-inspection-output.txt" \
+   && grep -F 'Discovered target IDs: NOT CHECKED (terminal cleanup)' \
+        "$TEST_TMP/terminal-inspection-output.txt" >/dev/null
+then
+  pass "terminal cleanup does not misleadingly report discovered target coverage as incomplete"
+else
+  fail "terminal cleanup does not misleadingly report discovered target coverage as incomplete"
+fi
+
 # -----------------------------------------------------------------------------
 # START semantics and mutation boundary fixtures
 # -----------------------------------------------------------------------------
@@ -388,6 +413,114 @@ else
   fail "zero exact-name candidates creates one complete blackout and accepts SCHEDULED"
 fi
 
+: > "$TEST_TMP/reuse-sequence.log"
+if (
+  mf_oem_validate_config() { :; }
+  mf_oem_prepare_inspection() {
+    : > "$4"; cp "$TEST_TMP/expected.json" "$5"; cp "$TEST_TMP/candidate-stopped.json" "$6"
+    cp "$TEST_TMP/inspection-terminal.json" "$7"
+  }
+  mf_oem_print_inspection() { :; }
+  mf_oem_verify_blackout_targets() { [ "$1" = BLACKOUT-NEW ]; }
+  mf_oem_wait_for_blackout_absent() {
+    [ "$1" = BLACKOUT-OLD ] || return 1
+    printf 'CONFIRM_ABSENT %s\n' "$1" >> "$TEST_TMP/reuse-sequence.log"
+  }
+  mf_oem_http() {
+    case "$1 $2" in
+      "DELETE https://oms.example:7803/em/api/blackouts/BLACKOUT-OLD")
+        printf 'DELETE_OLD %s\n' "$2" >> "$TEST_TMP/reuse-sequence.log"
+        : > "$3"; MF_OEM_HTTP_STATUS=204 ;;
+      "POST https://oms.example:7803/em/api/blackouts")
+        printf 'POST_CREATE %s\n' "$2" >> "$TEST_TMP/reuse-sequence.log"
+        cp "$TEST_TMP/create-response.json" "$3"; MF_OEM_HTTP_STATUS=201 ;;
+      *) return 1 ;;
+    esac
+  }
+  mf_oem_start_blackout MIG-42 42 CDBA CDBA_M1 12:00 >/dev/null 2>&1 \
+    && [ "$MF_OEM_DELETE_MUTATION_ATTEMPTED" = Y ] \
+    && [ "$MF_OEM_START_MUTATION_ATTEMPTED" = Y ] \
+    && [ "$(sed -n '1p' "$TEST_TMP/reuse-sequence.log")" = \
+         "DELETE_OLD https://oms.example:7803/em/api/blackouts/BLACKOUT-OLD" ] \
+    && [ "$(sed -n '2p' "$TEST_TMP/reuse-sequence.log")" = \
+         "CONFIRM_ABSENT BLACKOUT-OLD" ] \
+    && [ "$(sed -n '3p' "$TEST_TMP/reuse-sequence.log")" = \
+         "POST_CREATE https://oms.example:7803/em/api/blackouts" ]
+)
+then
+  pass "START deletes one terminal canonical ID, confirms absence, then recreates the same name"
+else
+  fail "START deletes one terminal canonical ID, confirms absence, then recreates the same name"
+fi
+
+write_json "$TEST_TMP/inspection-stop-pending.json" '{
+  "candidateCount":1,"activeCandidateCount":1,"blackoutId":"BLACKOUT-OLD",
+  "status":"STOP_PENDING","exactTargetIds":true,"expectedTargets":[]
+}'
+write_json "$TEST_TMP/detail-stop-pending.json" \
+  '{"id":"BLACKOUT-OLD","name":"MF_2_CDBA_Migration","status":"STOP_PENDING"}'
+: > "$TEST_TMP/pending-recovery-sequence.log"
+if (
+  mf_oem_validate_config() { MF_OEM_STOP_PENDING_TIMEOUT=300; }
+  mf_oem_prepare_inspection() {
+    : > "$4"; cp "$TEST_TMP/expected.json" "$5"; cp "$TEST_TMP/candidate-stopped.json" "$6"
+    cp "$TEST_TMP/inspection-stop-pending.json" "$7"
+  }
+  mf_oem_print_inspection() { :; }
+  mf_oem_get_blackout() {
+    printf 'POLL %s\n' "$1" >> "$TEST_TMP/pending-recovery-sequence.log"
+    cp "$TEST_TMP/detail-stopped-old.json" "$2"
+  }
+  mf_oem_wait_for_blackout_absent() {
+    printf 'CONFIRM_ABSENT %s\n' "$1" >> "$TEST_TMP/pending-recovery-sequence.log"
+  }
+  mf_oem_verify_blackout_targets() { [ "$1" = BLACKOUT-NEW ]; }
+  mf_oem_http() {
+    case "$1 $2" in
+      "DELETE https://oms.example:7803/em/api/blackouts/BLACKOUT-OLD")
+        printf 'DELETE %s\n' "$2" >> "$TEST_TMP/pending-recovery-sequence.log"
+        : > "$3"; MF_OEM_HTTP_STATUS=204 ;;
+      "POST https://oms.example:7803/em/api/blackouts")
+        printf 'POST_CREATE %s\n' "$2" >> "$TEST_TMP/pending-recovery-sequence.log"
+        cp "$TEST_TMP/create-response.json" "$3"; MF_OEM_HTTP_STATUS=201 ;;
+      *) return 1 ;;
+    esac
+  }
+  mf_oem_start_blackout MIG-42 42 CDBA CDBA_M1 12:00 >/dev/null 2>&1 \
+    && [ "$(sed -n '1p' "$TEST_TMP/pending-recovery-sequence.log")" = "POLL BLACKOUT-OLD" ] \
+    && [ "$(sed -n '2p' "$TEST_TMP/pending-recovery-sequence.log")" = \
+         "DELETE https://oms.example:7803/em/api/blackouts/BLACKOUT-OLD" ] \
+    && [ "$(sed -n '3p' "$TEST_TMP/pending-recovery-sequence.log")" = "CONFIRM_ABSENT BLACKOUT-OLD" ] \
+    && [ "$(sed -n '4p' "$TEST_TMP/pending-recovery-sequence.log")" = \
+         "POST_CREATE https://oms.example:7803/em/api/blackouts" ]
+)
+then
+  pass "START waits for STOP_PENDING to become terminal before delete, absence confirmation, and recreate"
+else
+  fail "START waits for STOP_PENDING to become terminal before delete, absence confirmation, and recreate"
+fi
+
+if (
+  mf_oem_validate_config() { MF_OEM_STOP_PENDING_TIMEOUT=0; MF_OEM_VERIFY_INTERVAL=0; }
+  mf_oem_prepare_inspection() {
+    : > "$4"; cp "$TEST_TMP/expected.json" "$5"; cp "$TEST_TMP/candidate-stopped.json" "$6"
+    cp "$TEST_TMP/inspection-stop-pending.json" "$7"
+  }
+  mf_oem_print_inspection() { :; }
+  mf_oem_get_blackout() { cp "$TEST_TMP/detail-stop-pending.json" "$2"; }
+  mf_oem_http() { return 99; }
+  mf_oem_start_blackout MIG-42 42 CDBA CDBA_M1 12:00 >"$TEST_TMP/pending-timeout.out" 2>&1
+  rc=$?
+  [ "$rc" -eq 3 ] \
+    && [ "$MF_OEM_MUTATION_ATTEMPTED" = N ] \
+    && grep -F 'remained STOP_PENDING for 0 seconds' "$TEST_TMP/pending-timeout.out" >/dev/null
+)
+then
+  pass "START fails safely without mutation when STOP_PENDING exceeds its recovery timeout"
+else
+  fail "START fails safely without mutation when STOP_PENDING exceeds its recovery timeout"
+fi
+
 if (
   mf_oem_validate_config() { :; }
   mf_oem_prepare_inspection() {
@@ -424,52 +557,61 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-# STOP -> terminal state -> DELETE and uncertainty fixtures
+# Non-blocking STOP and START-owned DELETE fixtures
 # -----------------------------------------------------------------------------
 
 write_json "$TEST_TMP/inspection-started.json" '{
   "candidateCount":1,"activeCandidateCount":1,"blackoutId":"BLACKOUT-1",
   "status":"STARTED","exactTargetIds":true,"expectedTargets":[]
 }'
-write_json "$TEST_TMP/detail-stopped.json" \
-  '{"id":"BLACKOUT-1","name":"MF_2_CDBA_Migration","status":"STOPPED"}'
 : > "$TEST_TMP/stop-sequence.log"
 if (
-  MF_OEM_GET_COUNT=0
   mf_oem_validate_config() { :; }
   mf_oem_prepare_inspection() {
     : > "$4"; cp "$TEST_TMP/expected.json" "$5"; cp "$TEST_TMP/candidate-one.json" "$6"
     cp "$TEST_TMP/inspection-started.json" "$7"
   }
   mf_oem_print_inspection() { :; }
-  mf_oem_get_blackout() {
-    MF_OEM_GET_COUNT=$((MF_OEM_GET_COUNT + 1))
-    if [ "$MF_OEM_GET_COUNT" -eq 1 ]; then cp "$TEST_TMP/detail-started.json" "$2"
-    else cp "$TEST_TMP/detail-stopped.json" "$2"; fi
-  }
+  mf_oem_get_blackout() { cp "$TEST_TMP/detail-started.json" "$2"; }
   mf_oem_http() {
-    case "$1 $2" in
-      "POST https://oms.example:7803/em/api/blackouts/BLACKOUT-1/actions/stop")
-        printf 'POST_STOP %s\n' "$2" >> "$TEST_TMP/stop-sequence.log"
-        : > "$3"; MF_OEM_HTTP_STATUS=204 ;;
-      "DELETE https://oms.example:7803/em/api/blackouts/BLACKOUT-1")
-        printf 'DELETE %s\n' "$2" >> "$TEST_TMP/stop-sequence.log"
-        : > "$3"; MF_OEM_HTTP_STATUS=204 ;;
-      *) return 1 ;;
-    esac
+    [ "$1 $2" = "POST https://oms.example:7803/em/api/blackouts/BLACKOUT-1/actions/stop" ] \
+      || return 1
+    printf 'POST_STOP %s\n' "$2" >> "$TEST_TMP/stop-sequence.log"
+    : > "$3"; MF_OEM_HTTP_STATUS=204
   }
   mf_oem_stop_blackout MIG-42 42 CDBA CDBA_M1 >/dev/null \
     && [ "$MF_OEM_STOP_MUTATION_ATTEMPTED" = Y ] \
-    && [ "$MF_OEM_DELETE_MUTATION_ATTEMPTED" = Y ] \
+    && [ "$MF_OEM_DELETE_MUTATION_ATTEMPTED" = N ] \
     && [ "$(sed -n '1p' "$TEST_TMP/stop-sequence.log")" = \
          "POST_STOP https://oms.example:7803/em/api/blackouts/BLACKOUT-1/actions/stop" ] \
-    && [ "$(sed -n '2p' "$TEST_TMP/stop-sequence.log")" = \
-         "DELETE https://oms.example:7803/em/api/blackouts/BLACKOUT-1" ]
+    && [ "$(wc -l < "$TEST_TMP/stop-sequence.log" | tr -d ' ')" -eq 1 ]
 )
 then
-  pass "STOP verifies one ID, waits for STOPPED, then deletes that same ID with HTTP 204"
+  pass "STOP verifies one STARTED ID, submits stop, and returns without polling or DELETE"
 else
-  fail "STOP verifies one ID, waits for STOPPED, then deletes that same ID with HTTP 204"
+  fail "STOP verifies one STARTED ID, submits stop, and returns without polling or DELETE"
+fi
+
+if (
+  mf_oem_validate_config() { :; }
+  mf_oem_prepare_inspection() {
+    : > "$4"; cp "$TEST_TMP/expected.json" "$5"; cp "$TEST_TMP/candidate-one.json" "$6"
+    cp "$TEST_TMP/inspection-started.json" "$7"
+  }
+  mf_oem_print_inspection() { :; }
+  mf_oem_get_blackout() { cp "$TEST_TMP/detail-started.json" "$2"; }
+  mf_oem_http() { return 1; }
+  mf_oem_stop_blackout MIG-42 42 CDBA CDBA_M1 >/dev/null 2>&1
+  rc=$?
+  [ "$rc" -ne 0 ] \
+    && [ "$MF_OEM_STOP_MUTATION_ATTEMPTED" = Y ] \
+    && [ "$MF_OEM_DELETE_MUTATION_ATTEMPTED" = N ] \
+    && [ "$MF_OEM_MUTATION_ATTEMPTED" = Y ]
+)
+then
+  pass "uncertain stop response is mutation-guarded but never followed by DELETE or emctl fallback"
+else
+  fail "uncertain stop response is mutation-guarded but never followed by DELETE or emctl fallback"
 fi
 
 if (
@@ -481,13 +623,118 @@ if (
   rc=$?
   [ "$rc" -ne 0 ] \
     && [ "$MF_OEM_DELETE_MUTATION_ATTEMPTED" = Y ] \
-    && [ "$MF_OEM_STOP_MUTATION_ATTEMPTED" = Y ] \
+    && [ "$MF_OEM_STOP_MUTATION_ATTEMPTED" = N ] \
     && [ "$MF_OEM_MUTATION_ATTEMPTED" = Y ]
 )
 then
   pass "uncertain DELETE response is mutation-guarded and cannot fall back to emctl"
 else
   fail "uncertain DELETE response is mutation-guarded and cannot fall back to emctl"
+fi
+
+if (
+  MF_OEM_VERIFY_ATTEMPTS=2
+  MF_OEM_VERIFY_INTERVAL=0
+  MF_OEM_ABSENCE_COUNT=0
+  mf_oem_find_exact_blackouts() {
+    MF_OEM_ABSENCE_COUNT=$((MF_OEM_ABSENCE_COUNT + 1))
+    if [ "$MF_OEM_ABSENCE_COUNT" -eq 1 ]
+    then cp "$TEST_TMP/candidate-stopped.json" "$1"
+    else cp "$TEST_TMP/candidates-zero.json" "$1"
+    fi
+    : > "$2"
+  }
+  mf_oem_wait_for_blackout_absent BLACKOUT-OLD \
+    && [ "$MF_OEM_ABSENCE_COUNT" -eq 2 ] \
+    && [ "$MF_OEM_EXACT_CANDIDATE_COUNT" -eq 0 ]
+)
+then
+  pass "START cleanup waits until the deleted canonical ID is no longer discoverable"
+else
+  fail "START cleanup waits until the deleted canonical ID is no longer discoverable"
+fi
+
+if (
+  MF_OEM_VERIFY_ATTEMPTS=1
+  MF_OEM_VERIFY_INTERVAL=0
+  mf_oem_find_exact_blackouts() {
+    cp "$TEST_TMP/candidate-stopped.json" "$1"; : > "$2"
+  }
+  mf_oem_wait_for_blackout_absent BLACKOUT-OLD >/dev/null 2>&1
+  [ "$?" -ne 0 ]
+)
+then
+  pass "START does not recreate while the deleted canonical ID remains discoverable"
+else
+  fail "START does not recreate while the deleted canonical ID remains discoverable"
+fi
+
+if (
+  mf_oem_http() { : > "$3"; MF_OEM_HTTP_STATUS=404; }
+  MF_OEM_DELETE_MUTATION_ATTEMPTED=N
+  MF_OEM_STOP_MUTATION_ATTEMPTED=N
+  MF_OEM_MUTATION_ATTEMPTED=N
+  mf_oem_delete_blackout BLACKOUT-1 >/dev/null 2>&1 \
+    && [ "$MF_OEM_DELETE_MUTATION_ATTEMPTED" = Y ]
+)
+then
+  pass "DELETE treats HTTP 404 as idempotent success when the verified blackout is already absent"
+else
+  fail "DELETE treats HTTP 404 as idempotent success when the verified blackout is already absent"
+fi
+
+if (
+  mf_oem_validate_config() { :; }
+  mf_oem_prepare_inspection() {
+    : > "$4"; cp "$TEST_TMP/expected.json" "$5"; cp "$TEST_TMP/candidate-stopped.json" "$6"
+    cp "$TEST_TMP/inspection-terminal.json" "$7"
+  }
+  mf_oem_print_inspection() { :; }
+  mf_oem_http() { return 99; }
+  mf_oem_stop_blackout MIG-42 42 CDBA CDBA_M1 >"$TEST_TMP/terminal-stop.out" 2>&1 \
+    && [ "$MF_OEM_DELETE_MUTATION_ATTEMPTED" = N ] \
+    && grep -F 'START will clean up the terminal definition' "$TEST_TMP/terminal-stop.out" >/dev/null
+)
+then
+  pass "repeated STOP treats a terminal blackout as complete and leaves cleanup to START"
+else
+  fail "repeated STOP treats a terminal blackout as complete and leaves cleanup to START"
+fi
+
+if (
+  mf_oem_validate_config() { :; }
+  mf_oem_prepare_inspection() {
+    : > "$4"; cp "$TEST_TMP/expected.json" "$5"; cp "$TEST_TMP/candidate-one.json" "$6"
+    cp "$TEST_TMP/inspection-stop-pending.json" "$7"
+  }
+  mf_oem_print_inspection() { :; }
+  mf_oem_http() { return 99; }
+  mf_oem_stop_blackout MIG-42 42 CDBA CDBA_M1 >"$TEST_TMP/pending-stop.out" 2>&1 \
+    && [ "$MF_OEM_STOP_MUTATION_ATTEMPTED" = N ] \
+    && [ "$MF_OEM_DELETE_MUTATION_ATTEMPTED" = N ] \
+    && grep -F 'already STOP_PENDING; STOP remains non-blocking' "$TEST_TMP/pending-stop.out" >/dev/null
+)
+then
+  pass "repeated STOP on STOP_PENDING is a non-blocking no-op"
+else
+  fail "repeated STOP on STOP_PENDING is a non-blocking no-op"
+fi
+
+if (
+  mf_oem_validate_config() { :; }
+  mf_oem_prepare_inspection() {
+    : > "$4"; cp "$TEST_TMP/expected.json" "$5"; cp "$TEST_TMP/candidates-zero.json" "$6"
+    cp "$TEST_TMP/inspection-create.json" "$7"
+  }
+  mf_oem_print_inspection() { :; }
+  mf_oem_http() { return 99; }
+  mf_oem_stop_blackout MIG-42 42 CDBA CDBA_M1 >"$TEST_TMP/stop-absent.out" 2>&1 \
+    && grep -F 'STOP is already complete' "$TEST_TMP/stop-absent.out" >/dev/null
+)
+then
+  pass "STOP is idempotent when no exact canonical blackout remains"
+else
+  fail "STOP is idempotent when no exact canonical blackout remains"
 fi
 
 if (
@@ -503,17 +750,9 @@ if (
   [ "$rc" -eq 3 ] && [ "$MF_OEM_MUTATION_ATTEMPTED" = N ]
 )
 then
-  pass "STOP rejects duplicate exact-name IDs without stopping or deleting any of them"
+  pass "STOP rejects duplicate exact-name IDs without mutating any of them"
 else
-  fail "STOP rejects duplicate exact-name IDs without stopping or deleting any of them"
-fi
-
-if grep -q '^DELETE https://oms.example:7803/em/api/blackouts/BLACKOUT-1$' "$TEST_TMP/stop-sequence.log" \
-   && grep -q '^POST_CREATE https://oms.example:7803/em/api/blackouts$' "$TEST_TMP/create-sequence.log"
-then
-  pass "successful delete leaves the zero-candidate START path available for canonical-name reuse without HTTP 409"
-else
-  fail "successful delete leaves the zero-candidate START path available for canonical-name reuse without HTTP 409"
+  fail "STOP rejects duplicate exact-name IDs without mutating any of them"
 fi
 
 # -----------------------------------------------------------------------------
@@ -554,11 +793,17 @@ fi
 if grep -F 'MF_OEM_MUTATION_ATTEMPTED:-N' "$MAIN_SCRIPT" >/dev/null \
    && grep -F 'MF_OEM_START_MUTATION_ATTEMPTED=Y' "$HELPER" >/dev/null \
    && grep -F 'MF_OEM_STOP_MUTATION_ATTEMPTED=Y' "$HELPER" >/dev/null \
-   && grep -F 'MF_OEM_DELETE_MUTATION_ATTEMPTED=Y' "$HELPER" >/dev/null
+   && grep -F 'MF_OEM_DELETE_MUTATION_ATTEMPTED=Y' "$HELPER" >/dev/null \
+   && grep -F 'Migration Factory will continue without emctl fallback' "$MAIN_SCRIPT" >/dev/null \
+   && grep -F 'MF_OEM_STOP_PENDING_TIMEOUT=${MF_OEM_STOP_PENDING_TIMEOUT:-300}' "$HELPER" >/dev/null \
+   && grep -F 'terminal cleanup is deferred to a later START' "$HELPER" >/dev/null \
+   && ! grep -F 'mf_oem_wait_for_stopped' "$HELPER" >/dev/null \
+   && ! grep -F 'mf_oem_http PATCH' "$HELPER" >/dev/null \
+   && ! grep -F 'die "Centralized OEM REST stop' "$MAIN_SCRIPT" >/dev/null
 then
-  pass "main fallback is blocked after create, stop, or delete may have been attempted"
+  pass "START owns bounded terminal cleanup while STOP remains non-blocking and mutation-guarded"
 else
-  fail "main fallback is blocked after create, stop, or delete may have been attempted"
+  fail "START owns bounded terminal cleanup while STOP remains non-blocking and mutation-guarded"
 fi
 
 if grep -F 'select prj_name, peer_tclu_id' "$HELPER" >/dev/null \

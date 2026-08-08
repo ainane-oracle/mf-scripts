@@ -33,7 +33,8 @@ VERSION=1.14
 #                  REST-first/local-emctl fallback before REST mutation; and
 #                  preserve a common blackout identity across both methods.
 # 08/08/2026 AIN - Version 1.14, simplify REST blackouts to one canonical ID,
-#                  duration-based START, and verified STOP then DELETE.
+#                  duration-based START, non-blocking STOP, and START-owned
+#                  terminal cleanup before canonical-name reuse.
 #
 # ************************************************************************** 
 SCRIPT_LIB="Migration Factory 2.0 : Manage EM blackouts for a target database"
@@ -474,7 +475,7 @@ touch $TMPFILE
         REST_RC=$?
         case "$REST_RC" in
           0) : ;;
-          3) die "An exact canonical OEM REST blackout exists but is duplicated, incomplete, or in a non-accepted state" ;;
+          3) die "An exact canonical OEM REST blackout is duplicated, incomplete, or not safely restartable" ;;
           *)
             if [ "${MF_OEM_MUTATION_ATTEMPTED:-N}" = "Y" ]
             then
@@ -512,18 +513,19 @@ touch $TMPFILE
         REST_RC=$?
         case "$REST_RC" in
           0) : ;;
-          3) die "STOP requires exactly one active exact-name OEM REST blackout with complete discovered target coverage" ;;
-          4) die "The verified canonical OEM REST blackout changed to a non-stoppable state" ;;
+          3) echo "WARNING: OEM REST STOP could not identify one safe canonical blackout; Migration Factory will continue" ;;
+          4) echo "WARNING: The canonical OEM REST blackout changed to a non-stoppable state; Migration Factory will continue" ;;
           *)
             if [ "${MF_OEM_MUTATION_ATTEMPTED:-N}" = "Y" ]
             then
-              die "Centralized OEM REST stop/delete outcome is uncertain or incomplete; local fallback is unsafe"
+              echo "WARNING: Centralized OEM REST stop outcome is uncertain or incomplete; Migration Factory will continue without emctl fallback"
             elif [ "${MF_OEM_EXACT_CANDIDATE_COUNT:-0}" -gt 0 ]
             then
-              die "An exact canonical OEM REST blackout exists but could not be verified for STOP; local fallback is unsafe"
+              echo "WARNING: An exact canonical OEM REST blackout could not be verified for STOP; Migration Factory will continue without emctl fallback"
+            else
+              echo "WARNING: OEM REST STOP workflow failed before mutation; falling back to local emctl"
+              USE_REST_API=N
             fi
-            echo "WARNING: OEM REST STOP workflow failed; falling back to local emctl"
-            USE_REST_API=N
             ;;
         esac
         ;;
