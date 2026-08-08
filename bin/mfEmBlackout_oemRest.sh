@@ -18,7 +18,7 @@ declare -a MF_OEM_TMP_FILES=()
 
 mf_oem_error()
 {
-  printf '  - OEM REST error: %s\n' "$*" >&2
+  printf '         - OEM REST error: %s\n' "$*" >&2
   return 1
 }
 
@@ -28,13 +28,13 @@ mf_oem_log()
   then
     infoAction "OEM REST: $*" "${I2:-  - }"
   else
-    printf 'OEM REST: %s\n' "$*"
+    printf '         - OEM REST: %s\n' "$*"
   fi
 }
 
 mf_oem_warning()
 {
-  printf '  - OEM REST warning: %s\n' "$*" >&2
+  printf '         - OEM REST warning: %s\n' "$*" >&2
 }
 
 mf_oem_blackout_name()
@@ -339,12 +339,7 @@ mf_oem_find_exact_blackouts()
   suffixed_count=$(jq 'length' "$suffixed_file") || return 1
   if [ "$suffixed_count" -gt 0 ]
   then
-    mf_oem_warning "Ignoring $suffixed_count blackout definition(s) with a suffixed name; expected name is $blackout_name"
-    jq -r '.[] | "Ignored timestamp-suffixed blackout: id=\(.id), name=\(.name), status=\(.status)"' \
-      "$suffixed_file" | while IFS= read -r message
-      do
-        mf_oem_warning "$message"
-      done || return 1
+    mf_oem_warning "Ignored $suffixed_count existing blackout definition(s) with a timestamp suffix; expected name is $blackout_name"
   fi
 }
 
@@ -1054,10 +1049,10 @@ mf_oem_is_blackout_on()
        .exactTargetIds
      ' "$inspection_file" >/dev/null
   then
-    printf '      Blackout is ON; all discovered targets are covered.\n'
+    printf '         Blackout is ON; all discovered targets are covered.\n'
     return 0
   fi
-  printf '      Blackout is not ON for all discovered targets.\n'
+  printf '         Blackout is not ON for all discovered targets.\n'
   return 3
 }
 
