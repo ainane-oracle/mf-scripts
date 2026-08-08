@@ -1061,9 +1061,9 @@ end ;
           tmp := tmp || chr(amp) || 'nbsp;' || '-' ||chr(amp) || 'nbsp;';
     l_url := '<A href="' || APEX_UTIL.PREPARE_URL(p_url => 'f?p='|| p_app_id || ':3700:' || p_session || '::NO:'||
                                                             ':P3700_COMMAND,P3700_TITLE' ||  ':' ||
-                                                            '$MF_BIN/mfEmBlackout.sh -m ' || rec.code || ' -r -A START ,Start OEM REST Blackout: go-live plus 12 hours; 12-hour fallback if not planned'
+                                                            '$MF_BIN/mfEmBlackout.sh -m ' || rec.code || ' -r -A START ,Start OEM REST Blackout for 12 hours'
                                                 ,p_checksum_type => 'SESSION') || '">' ||
-            'Start (GL+12h / 12h fallback)</A>' ||
+            'Start (12h)</A>' ||
             '';
     tmp := tmp || l_url ;
 

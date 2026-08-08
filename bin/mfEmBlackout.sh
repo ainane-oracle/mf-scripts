@@ -15,7 +15,7 @@
 #
 # *****************************************************************************
 
-VERSION=1.13
+VERSION=1.14
 # ************************************************************************** 
 # Modifications :
 # =============
@@ -24,17 +24,16 @@ VERSION=1.13
 #                  sub processes, temporary files cleanup (mktemp with suffixes)
 #
 # 15/11/2024 MBO - Version 1.2.5, before LOT-0 start,
-# 06/08/2026     - Version 1.9, create START blackouts centrally through the
+# 06/08/2026 AIN - Version 1.9, create START blackouts centrally through the
 #                  OEM REST API and preserve the legacy non-START actions.
-# 06/08/2026     - Version 1.10, set REST timeToEnd to the current planned
-#                  go-live time plus twelve hours.
-# 06/08/2026     - Version 1.11, use a twelve-hour duration when no current
-#                  planned go-live exists and default to STATUS.
-# 07/08/2026     - Version 1.12, preserve local emctl behavior by default and
+# 06/08/2026 AIN - Versions 1.10-1.11, iterate on centralized REST scheduling.
+# 07/08/2026 AIN - Version 1.12, preserve local emctl behavior by default and
 #                  add opt-in OEM REST handling for every action with -r.
-# 07/08/2026     - Version 1.13, retain the compatible START default; use
+# 08/08/2026 AIN - Version 1.13, retain the compatible START default; use
 #                  REST-first/local-emctl fallback before REST mutation; and
 #                  preserve a common blackout identity across both methods.
+# 08/08/2026 AIN - Version 1.14, simplify REST blackouts to one canonical ID,
+#                  duration-based START, and verified STOP then DELETE.
 #
 # ************************************************************************** 
 SCRIPT_LIB="Migration Factory 2.0 : Manage EM blackouts for a target database"
@@ -262,13 +261,12 @@ Required:
 
 Options:
   -A action              : Operation to execute [DEFAULT: START] - START : Creates the.
-                             blackout. With -r, it ends at planned go-live plus.
-                             12 hours, or lasts 12 hours when no go-live is planned.
+                             blackout for the requested duration.
                              (monitoring alerts are not raised) - STOP : Removes the.
                              blackout (monitoring alerts will resume) - STATUS : Show the.
                              status of the blackout - IS_ON : returns 0 if Blackout is ON.
-  -d duration            : Legacy START duration, format [D] HH:MI [DEFAULT: 12h].
-                             Ignored when -r is used.
+  -d duration            : START duration, format [D] HH:MI [DEFAULT: 12h].
+                             REST translates it to durationHours/durationMinutes.
   -r                     : Use the centralized OEM REST API for the selected action.
                              Without -r, all actions retain local emctl behavior.
   -Q                     : Quiet mode (remove progress output).
@@ -280,7 +278,7 @@ Options:
 Examples:
   $(basename "$0") -m MIGRATION_ID
   $(basename "$0") -m MIGRATION_ID -A START -d 02:00
-  $(basename "$0") -m MIGRATION_ID -r -A START
+  $(basename "$0") -m MIGRATION_ID -r -A START -d 02:00
   $(basename "$0") -m MIGRATION_ID -r -A STATUS
 
 Notes:
@@ -348,7 +346,6 @@ touch $TMPFILE
   MF_MIGRATION_ID=""                         # Mandatory to pass as argument
   ACTION=START
   DURATION="12:00"
-  DURATION_EXPLICIT=N
   USE_REST_API=N
   toShift=0
   while getopts :m:A:d:rQVnh opt
@@ -356,7 +353,7 @@ touch $TMPFILE
     case $opt in
      # --------- Script parameters ---------------------------------------------
      A) ACTION=${OPTARG^^}                            ; toShift=$(($toShift + 2)) ;;
-     d) DURATION=${OPTARG^^} ; DURATION_EXPLICIT=Y   ; toShift=$(($toShift + 2)) ;;
+     d) DURATION=${OPTARG^^}                          ; toShift=$(($toShift + 2)) ;;
      r) USE_REST_API=Y                                ; toShift=$(($toShift + 1)) ;;
      # --------- Common parameters ---------------------------------------------
      Q) setVar LOG_QUIET                  Y           ; toShift=$(($toShift + 1)) ;;
@@ -463,10 +460,6 @@ touch $TMPFILE
   echo
 
   EMCTL=/u02/app/oracle/oem/agent/agent_inst/bin/emctl
-  # The Migration Factory blackout identity is canonical across REST and emctl.
-  # Do not accept timestamped or caller-provided variants.
-  MF_OEM_BLACKOUT_NAME=MF_2_${CDB_NAME}_Migration
-
   startStep "$ACTION a blackout for a database ($CDB_NAME)"
 
   ERR=0
@@ -476,65 +469,26 @@ touch $TMPFILE
     trap mf_oem_cleanup EXIT
     case "$ACTION" in
       START)
-        if [ "$USE_REST_API" = "Y" ]
-        then
-          [ "$DURATION_EXPLICIT" = "N" ] \
-            || infoAction "Ignoring -d in REST mode; REST scheduling uses planned go-live or the 12-hour fallback" "$I1"
-
-          PLAN_COUNT=
-          if ! TIME_TO_END=$(exec_sql "$MF_REPO_CONNECT" "
-                                          select to_char(count(*)) || '|' || to_char(max(
-                                                   sys_extract_utc(
-                                                     from_tz(cast(po.target_date as timestamp), sessiontimezone)
-                                                   ) + interval '12' hour
-                                                 ), 'YYYY-MM-DD\"T\"HH24:MI\"Z\"')
-                                          from migration_planned_operations po
-                                          where po.mig_id = $MFAUTO_MIG_ID
-                                            and po.mls_id = mf_mig_parameters.get_id('MLS_ID_GOLIVE_START', po.prj_name)
-                                            and po.current_plan = 'Y';")
-          then
-            echo "WARNING: Unable to query planned go-live; using a 12-hour OEM blackout duration"
-            TIME_TO_END=
-          fi
-          TIME_TO_END=$(printf '%s\n' "$TIME_TO_END" \
-            | sed -e '/^[[:space:]]*$/d' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
-          if [[ "$TIME_TO_END" == *"|"* ]]
-          then
-            PLAN_COUNT=${TIME_TO_END%%|*}
-            TIME_TO_END=${TIME_TO_END#*|}
-          else
-            echo "WARNING: Planned go-live query returned an invalid value; using a 12-hour OEM blackout duration"
-            TIME_TO_END=
-          fi
-          if [ -z "$TIME_TO_END" ]
-          then
-            infoAction "No current planned go-live; using a 12-hour OEM blackout duration" "$I1"
-          elif ! mf_oem_validate_time_to_end "$TIME_TO_END"
-          then
-            echo "WARNING: Invalid planned go-live value; using a 12-hour OEM blackout duration"
-            TIME_TO_END=
-          else
-            if [[ "$PLAN_COUNT" =~ ^[0-9]+$ ]] && [ "$PLAN_COUNT" -gt 1 ]
-            then
-              echo "WARNING: $PLAN_COUNT current planned go-live values found; using the furthest value"
-            fi
-            infoAction "OEM blackout timeToEnd (furthest current planned go-live + 12 hours): $TIME_TO_END" "$I1"
-          fi
-
-          if ! mf_oem_start_blackout "$MF_MIGRATION_ID" "$MFAUTO_MIG_ID" "$CDB_NAME" \
-               "$TARGETCONTAINERDATABASE_CONNECTIONDETAILS_SERVICENAME" "$TIME_TO_END"
-          then
-            if [ "${MF_OEM_START_MUTATION_ATTEMPTED:-N}" = "Y" ]
+        mf_oem_start_blackout "$MF_MIGRATION_ID" "$MFAUTO_MIG_ID" "$CDB_NAME" \
+          "$TARGETCONTAINERDATABASE_CONNECTIONDETAILS_SERVICENAME" "$DURATION"
+        REST_RC=$?
+        case "$REST_RC" in
+          0) : ;;
+          3) die "An exact canonical OEM REST blackout exists but is duplicated, incomplete, or in a non-accepted state" ;;
+          *)
+            if [ "${MF_OEM_MUTATION_ATTEMPTED:-N}" = "Y" ]
             then
               die "Centralized OEM REST blackout outcome is uncertain or incomplete; local fallback is unsafe"
+            elif [ "${MF_OEM_EXACT_CANDIDATE_COUNT:-0}" -gt 0 ]
+            then
+              die "An exact canonical OEM REST blackout exists but could not be verified; local fallback is unsafe"
             fi
             echo "WARNING: OEM REST START failed before create; falling back to local emctl"
             USE_REST_API=N
-          fi
-        fi
+            ;;
+        esac
         ;;
       STATUS)
-        MF_OEM_LOOKUP_RESULT=
         if ! mf_oem_status_blackout "$MF_MIGRATION_ID" "$MFAUTO_MIG_ID" "$CDB_NAME" \
              "$TARGETCONTAINERDATABASE_CONNECTIONDETAILS_SERVICENAME"
         then
@@ -548,7 +502,7 @@ touch $TMPFILE
         REST_RC=$?
         case "$REST_RC" in
           0) : ;;
-          3) die "Canonical OEM REST blackout coverage is incomplete or not active" ;;
+          3) die "Canonical OEM REST blackout is not STARTED with complete discovered target coverage" ;;
           *) echo "WARNING: OEM REST IS_ON workflow failed; falling back to local emctl"; USE_REST_API=N ;;
         esac
         ;;
@@ -558,12 +512,15 @@ touch $TMPFILE
         REST_RC=$?
         case "$REST_RC" in
           0) : ;;
-          3) die "No complete canonical OEM REST blackout is active" ;;
-          4) die "More than one complete canonical OEM REST blackout is active" ;;
+          3) die "STOP requires exactly one active exact-name OEM REST blackout with complete discovered target coverage" ;;
+          4) die "The verified canonical OEM REST blackout changed to a non-stoppable state" ;;
           *)
-            if [ "${MF_OEM_STOP_MUTATION_ATTEMPTED:-N}" = "Y" ]
+            if [ "${MF_OEM_MUTATION_ATTEMPTED:-N}" = "Y" ]
             then
-              die "Centralized OEM REST stop outcome is uncertain or incomplete; local fallback is unsafe"
+              die "Centralized OEM REST stop/delete outcome is uncertain or incomplete; local fallback is unsafe"
+            elif [ "${MF_OEM_EXACT_CANDIDATE_COUNT:-0}" -gt 0 ]
+            then
+              die "An exact canonical OEM REST blackout exists but could not be verified for STOP; local fallback is unsafe"
             fi
             echo "WARNING: OEM REST STOP workflow failed; falling back to local emctl"
             USE_REST_API=N
@@ -577,8 +534,8 @@ touch $TMPFILE
 
   if [ "$USE_REST_API" != "Y" ]
   then
-    # Default compatibility path: every action retains its original local-agent
-    # emctl behavior and blackout naming unless -r is supplied.
+    # Default compatibility path: retain the original local-agent emctl command
+    # behavior unless -r is supplied.
     for node in $(exec_sql "$MF_REPO_CONNECT" "
                                                 SELECT
                                                   tn.fqdn  
@@ -603,20 +560,21 @@ touch $TMPFILE
     echo
     
     case $ACTION in
+      # START)  targets=$(exec_on_target -tty "${MF_SUDOER:-opc}@$node" "oracle" "$EMCTL config agent listtargets" | grep $CDB_NAME | sed -e "s;\[;;" -e "s;\];;" -e "s; *, *;:;" | tr '\n' ' ')
       START)  exec_on_target -verbose "${MF_SUDOER:-opc}@$node" "oracle" "$EMCTL config agent listtargets | grep $CDB_NAME | grep oracle_database"
               targets=$(exec_on_target -tty "${MF_SUDOER:-opc}@$node" "oracle" "$EMCTL config agent listtargets" | grep $CDB_NAME | grep oracle_database | sed -e "s;\[;;" -e "s;\];;" -e "s; *, *;:;" | cut -f1 -d":" |tr '\n' ' ')
               infoAction "Blacked out = $targets" "$I2"
-              exec_on_target -verbose "${MF_SUDOER:-opc}@$node" "oracle" "$EMCTL start blackout $MF_OEM_BLACKOUT_NAME \$(echo \"$targets\") -d $DURATION" \
+              exec_on_target -verbose "${MF_SUDOER:-opc}@$node" "oracle" "$EMCTL start blackout MF_2_${CDB_NAME}_Migration \$(echo \"$targets\") -d $DURATION" \
                                      "Create Migration factory blackout for $CDB_NAME" "$I2"
              ;;
       STATUS) exec_on_target -verbose "${MF_SUDOER:-opc}@$node" "oracle" "$EMCTL status blackout | awk 'BEGIN {pr=0} /${CDB_NAME}_Migration/ {pr=1 ; printf(\"* * * * * * * * * * * * * * * * * * %s * * * * * * * * * * * * * * * * * *\n\",\$0) ; next} /Expired/ {if (pr==1) {print} ; pr=0 ; next } {if (pr==1) print}'" \
                                      "Status of Migration Factory blackout for $CDB_NAME" "$I2"      
              ;;
-      STOP) exec_on_target -verbose "${MF_SUDOER:-opc}@$node" "oracle" "$EMCTL stop blackout $MF_OEM_BLACKOUT_NAME" \
+      STOP) exec_on_target -verbose "${MF_SUDOER:-opc}@$node" "oracle" "$EMCTL stop blackout MF_2_${CDB_NAME}_Migration" \
                                      "Remove Migration Factory blackout for $CDB_NAME" "$I2"      
              ;;
-      IS_ON) libAction "Testing if $MF_OEM_BLACKOUT_NAME is present" "$I2"
-             if [ "$(exec_on_target -tty "${MF_SUDOER:-opc}@$node" "oracle" "$EMCTL status blackout" | grep -F "$MF_OEM_BLACKOUT_NAME")" != "" ]
+      IS_ON) libAction "Testing if MF_${CDB_NAME}_Migration id present" "$I2"
+             if [ "$(exec_on_target -tty "${MF_SUDOER:-opc}@$node" "oracle" "$EMCTL status blackout" | grep MF_2.*${CDB_NAME}_Migration)" != "" ]
              then
                echo "Blackout is ON"
              else 
