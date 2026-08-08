@@ -24,15 +24,15 @@ VERSION=1.13
 #                  sub processes, temporary files cleanup (mktemp with suffixes)
 #
 # 15/11/2024 MBO - Version 1.2.5, before LOT-0 start,
-# 06/08/2026 AIN - Version 1.9, create START blackouts centrally through the
+# 06/08/2026     - Version 1.9, create START blackouts centrally through the
 #                  OEM REST API and preserve the legacy non-START actions.
-# 06/08/2026 AIN - Version 1.10, set REST timeToEnd to the current planned
+# 06/08/2026     - Version 1.10, set REST timeToEnd to the current planned
 #                  go-live time plus twelve hours.
-# 06/08/2026 AIN - Version 1.11, use a twelve-hour duration when no current
+# 06/08/2026     - Version 1.11, use a twelve-hour duration when no current
 #                  planned go-live exists and default to STATUS.
-# 07/08/2026 AIN - Version 1.12, preserve local emctl behavior by default and
+# 07/08/2026     - Version 1.12, preserve local emctl behavior by default and
 #                  add opt-in OEM REST handling for every action with -r.
-# 07/08/2026 AIN - Version 1.13, retain the compatible START default; use
+# 07/08/2026     - Version 1.13, retain the compatible START default; use
 #                  REST-first/local-emctl fallback before REST mutation; and
 #                  preserve a common blackout identity across both methods.
 #
@@ -158,7 +158,7 @@ detailed_usage()
       - Analyze parameters
       - Set general dependent variables
       - Set script specific variables
-      - Premiminary verifications
+      - Preliminary verifications
 
   Operational notes
   =================
@@ -425,7 +425,7 @@ touch $TMPFILE
   fi
   rm -f $TMPFILE
 
-  startStep "Premiminary verifications"
+  startStep "Preliminary verifications"
   mfSetGlobalEnv >/dev/null
   # mfSetConnectStrings                                        # Build connection strings
   # mfTestDatabaseConnections                                  # Tests all the database connections (must be OK to continue)
