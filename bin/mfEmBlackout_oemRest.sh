@@ -1,8 +1,32 @@
 #!/usr/bin/env bash
 
-# OEM REST support for every mfEmBlackout.sh action selected with -r.
-# Authentication is passed to curl over stdin so the password is never present in
-# the process command line, logs, response files, or temporary files.
+# -----------------------------------------------------------------------------
+# File        : mfEmBlackout_oemRest.sh
+# Purpose     : Provide OEM REST API support for mfEmBlackout.sh when -r is used.
+#
+# Actions     : Discover typed OEM targets, create/verify/stop blackouts, and
+#               report blackout status through the centralized OEM REST API.
+#
+# Security    : Basic authentication is passed to curl through stdin. Passwords
+#               are not placed on the process command line, in logs, response
+#               files, or temporary files. REST working files are mode 600 and
+#               are removed when the operation completes.
+#
+# Lookup      : Blackout lookup first uses an exact `name` query. If the OEM
+#               endpoint rejects it or no active exact match is found, lookup
+#               falls back to `nameMatches=*<blackout_name>*`. Multiple active
+#               matches remain an error to prevent selecting the wrong blackout.
+#
+# Compatibility: Sort parameters were removed because the deployed OEM API does
+#               not accept the previously used id/name sort fields. Results are
+#               validated and selected locally, so ordering is not required.
+#
+# Modifications:
+# - REST support is opt-in from mfEmBlackout.sh via -r.
+# - Added exact-name lookup with a nameMatches wildcard fallback.
+# - Removed unsupported sort query parameters from REST collection requests.
+# - Added protected blackout state persistence for later verification/STOP use.
+# -----------------------------------------------------------------------------
 
 declare -a MF_OEM_TMP_FILES=()
 
@@ -287,20 +311,36 @@ mf_oem_select_active_blackout()
   local blackouts_file="$1"
   local blackout_name="$2"
   local output_file="$3"
+  local match_mode="${4:-exact}"
   local selected_file count
 
   mf_oem_new_temp_file selected_file || return 1
-  jq --arg name "$blackout_name" '
-    [ .[] |
-      select(.name == $name) |
-      select(.status as $status | [
-        "SCHEDULED", "START_PROCESSING", "START_PARTIAL", "STARTED",
-        "STOP_PENDING", "STOP_FAILED", "STOP_PARTIAL",
-        "EDIT_PENDING", "EDIT_FAILED", "EDIT_PARTIAL", "END_PARTIAL"
-      ] | index($status) != null)
-    ] | unique_by(.id)
-  ' "$blackouts_file" > "$selected_file" \
-    || mf_oem_error "Unable to select the active OEM blackout" || return 1
+  if [ "$match_mode" = "contains" ]
+  then
+    jq --arg name "$blackout_name" '
+      [ .[] |
+        select(.name | contains($name)) |
+        select(.status as $status | [
+          "SCHEDULED", "START_PROCESSING", "START_PARTIAL", "STARTED",
+          "STOP_PENDING", "STOP_FAILED", "STOP_PARTIAL",
+          "EDIT_PENDING", "EDIT_FAILED", "EDIT_PARTIAL", "END_PARTIAL"
+        ] | index($status) != null)
+      ] | unique_by(.id)
+    ' "$blackouts_file" > "$selected_file" \
+      || mf_oem_error "Unable to select the active OEM blackout" || return 1
+  else
+    jq --arg name "$blackout_name" '
+      [ .[] |
+        select(.name == $name) |
+        select(.status as $status | [
+          "SCHEDULED", "START_PROCESSING", "START_PARTIAL", "STARTED",
+          "STOP_PENDING", "STOP_FAILED", "STOP_PARTIAL",
+          "EDIT_PENDING", "EDIT_FAILED", "EDIT_PARTIAL", "END_PARTIAL"
+        ] | index($status) != null)
+      ] | unique_by(.id)
+    ' "$blackouts_file" > "$selected_file" \
+      || mf_oem_error "Unable to select the active OEM blackout" || return 1
+  fi
 
   count=$(jq 'length' "$selected_file") || return 1
   case "$count" in
@@ -315,15 +355,25 @@ mf_oem_find_active_blackout()
   local migration_id="$1"
   local output_file="$2"
   local blackout_name
-  local encoded url blackouts_file
+  local encoded url blackouts_file fallback_file rc
 
   blackout_name=$(mf_oem_blackout_name "$migration_id") || return 1
 
   encoded=$(printf '%s' "$blackout_name" | mf_oem_urlencode) || return 1
-  url="${MF_OEM_API_BASE_URL}/em/api/blackouts?limit=2000&sort=id%3AASC&name=${encoded}"
+  url="${MF_OEM_API_BASE_URL}/em/api/blackouts?limit=2000&name=${encoded}"
   mf_oem_new_temp_file blackouts_file || return 1
-  mf_oem_fetch_blackout_pages "$url" "$blackouts_file" || return 1
-  mf_oem_select_active_blackout "$blackouts_file" "$blackout_name" "$output_file"
+  if mf_oem_fetch_blackout_pages "$url" "$blackouts_file"
+  then
+    mf_oem_select_active_blackout "$blackouts_file" "$blackout_name" "$output_file"
+    rc=$?
+    [ "$rc" -eq 0 ] && return 0
+  fi
+
+  encoded=$(printf '*%s*' "$blackout_name" | mf_oem_urlencode) || return 1
+  url="${MF_OEM_API_BASE_URL}/em/api/blackouts?limit=2000&nameMatches=${encoded}"
+  mf_oem_new_temp_file fallback_file || return 1
+  mf_oem_fetch_blackout_pages "$url" "$fallback_file" || return 1
+  mf_oem_select_active_blackout "$fallback_file" "$blackout_name" "$output_file" contains
 }
 
 mf_oem_append_json_array()
@@ -411,7 +461,7 @@ mf_oem_discover_targets()
         pattern="%${cdb}%"
       fi
       encoded=$(printf '%s' "$pattern" | mf_oem_urlencode) || return 1
-      url="${MF_OEM_API_BASE_URL}/em/api/targets?limit=2000&sort=name%3AASC&typeName=${type}&nameMatches=${encoded}"
+      url="${MF_OEM_API_BASE_URL}/em/api/targets?limit=2000&typeName=${type}&nameMatches=${encoded}"
       mf_oem_new_temp_file query_file || return 1
       mf_oem_fetch_target_pages "$url" "/em/api/targets" "$type" "$cdb" "$query_file" || return 1
       mf_oem_append_json_array "$output_file" "$query_file" || return 1
@@ -609,7 +659,7 @@ mf_oem_verify_blackout_targets()
   local actual_file expected_ids actual_ids
   mf_oem_new_temp_file actual_file || return 1
   mf_oem_fetch_target_pages \
-    "${MF_OEM_API_BASE_URL}/em/api/blackouts/${blackout_id}/targets?limit=2000&sort=id%3AASC" \
+    "${MF_OEM_API_BASE_URL}/em/api/blackouts/${blackout_id}/targets?limit=2000" \
     "/em/api/blackouts/${blackout_id}/targets" "" "" "$actual_file" || return 1
 
   expected_ids=$(jq -c '[.[] | [.id, .name, .typeName]] | sort | unique' "$expected_file") || return 1
