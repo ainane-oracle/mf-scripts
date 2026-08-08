@@ -326,7 +326,7 @@ touch $TMPFILE
   do
     . $s || { echo "Error sourcing the utilities ($s) script" ; exit 1 ; }
   done
-  startStep "Initialization"
+  startStep "Initialization"                                      >> "$TMPFILE"
   #
   #     In this section, position variables to be used in the script,
   #  use the setVar function if you want to have them printed on the screen (they will be added to the log when  
@@ -438,27 +438,21 @@ touch $TMPFILE
   #
   if [ "$(echo $TARGETCONTAINERDATABASE_CONNECTIONDETAILS_SERVICENAME | grep "_")" != "" ]
   then
-    echo
-    echo "            - ORACLE Naming convention"
+    infoAction "Company naming convention" "$I1"
     CDB_NAME=$(echo $TARGETCONTAINERDATABASE_CONNECTIONDETAILS_SERVICENAME | sed -e "s;_.*$;;")
     CDB_UNIQUE_NAME=$TARGETCONTAINERDATABASE_CONNECTIONDETAILS_SERVICENAME
   elif [[ $TARGETCONTAINERDATABASE_CONNECTIONDETAILS_SERVICENAME =~ ^C.*M[0-9]*$ ]]
   then
-    echo
-    echo "            - BNP Naming convention"
+    infoAction "Company naming convention" "$I1"
     CDB_NAME=$(echo $TARGETCONTAINERDATABASE_CONNECTIONDETAILS_SERVICENAME | sed -e "s;M[0-9]*$;;")
     CDB_UNIQUE_NAME=$TARGETCONTAINERDATABASE_CONNECTIONDETAILS_SERVICENAME
   else
-    echo
-    echo "            - Direct naming"
     CDB_NAME=$TARGETCONTAINERDATABASE_CONNECTIONDETAILS_SERVICENAME
     CDB_UNIQUE_NAME=$TARGETCONTAINERDATABASE_CONNECTIONDETAILS_SERVICENAME
   fi
 
-  echo
-  echo "      CDB_NAME           : $CDB_NAME"
-  echo "      CDB_UNIQUE_NAME    : $CDB_UNIQUE_NAME"
-  echo
+  infoAction "Database              : $CDB_NAME" "$I1"
+  infoAction "Database unique name  : $CDB_UNIQUE_NAME" "$I1"
 
   EMCTL=/u02/app/oracle/oem/agent/agent_inst/bin/emctl
   startStep "$ACTION a blackout for a database ($CDB_NAME)"
@@ -484,7 +478,7 @@ touch $TMPFILE
             then
               die "An exact canonical OEM REST blackout exists but could not be verified; local fallback is unsafe"
             fi
-            echo "WARNING: OEM REST START failed before create; falling back to local emctl"
+            mf_oem_warning "OEM REST START failed before create; falling back to local emctl"
             USE_REST_API=N
             ;;
         esac
@@ -493,7 +487,7 @@ touch $TMPFILE
         if ! mf_oem_status_blackout "$MF_MIGRATION_ID" "$MFAUTO_MIG_ID" "$CDB_NAME" \
              "$TARGETCONTAINERDATABASE_CONNECTIONDETAILS_SERVICENAME"
         then
-          echo "WARNING: OEM REST STATUS workflow failed; falling back to local emctl"
+          mf_oem_warning "OEM REST STATUS workflow failed; falling back to local emctl"
           USE_REST_API=N
         fi
         ;;
@@ -504,7 +498,7 @@ touch $TMPFILE
         case "$REST_RC" in
           0) : ;;
           3) die "Canonical OEM REST blackout is not STARTED with complete discovered target coverage" ;;
-          *) echo "WARNING: OEM REST IS_ON workflow failed; falling back to local emctl"; USE_REST_API=N ;;
+          *) mf_oem_warning "OEM REST IS_ON workflow failed; falling back to local emctl"; USE_REST_API=N ;;
         esac
         ;;
       STOP)
@@ -513,17 +507,17 @@ touch $TMPFILE
         REST_RC=$?
         case "$REST_RC" in
           0) : ;;
-          3) echo "WARNING: OEM REST STOP could not identify one safe canonical blackout; Migration Factory will continue" ;;
-          4) echo "WARNING: The canonical OEM REST blackout changed to a non-stoppable state; Migration Factory will continue" ;;
+          3) mf_oem_warning "OEM REST STOP could not identify one safe blackout; Migration Factory will continue" ;;
+          4) mf_oem_warning "The OEM REST blackout changed to a non-stoppable state; Migration Factory will continue" ;;
           *)
             if [ "${MF_OEM_MUTATION_ATTEMPTED:-N}" = "Y" ]
             then
-              echo "WARNING: Centralized OEM REST stop outcome is uncertain or incomplete; Migration Factory will continue without emctl fallback"
+              mf_oem_warning "OEM REST STOP outcome is uncertain or incomplete; Migration Factory will continue without emctl fallback"
             elif [ "${MF_OEM_EXACT_CANDIDATE_COUNT:-0}" -gt 0 ]
             then
-              echo "WARNING: An exact canonical OEM REST blackout could not be verified for STOP; Migration Factory will continue without emctl fallback"
+              mf_oem_warning "An OEM REST blackout could not be verified for STOP; Migration Factory will continue without emctl fallback"
             else
-              echo "WARNING: OEM REST STOP workflow failed before mutation; falling back to local emctl"
+              mf_oem_warning "OEM REST STOP failed before mutation; falling back to local emctl"
               USE_REST_API=N
             fi
             ;;
@@ -578,12 +572,11 @@ touch $TMPFILE
       IS_ON) libAction "Testing if MF_${CDB_NAME}_Migration id present" "$I2"
              if [ "$(exec_on_target -tty "${MF_SUDOER:-opc}@$node" "oracle" "$EMCTL status blackout" | grep MF_2.*${CDB_NAME}_Migration)" != "" ]
              then
-               echo "Blackout is ON"
+               infoAction "Blackout is active" "$I2"
              else 
-               echo "**** NO BLACKOUT *****"
+               infoAction "Blackout is not active" "$I2"
                die "One or more servers are not under blackout"
              fi
-             echo       
              ;;
     esac
     done
