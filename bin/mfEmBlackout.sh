@@ -438,12 +438,12 @@ touch $TMPFILE
   #
   if [ "$(echo $TARGETCONTAINERDATABASE_CONNECTIONDETAILS_SERVICENAME | grep "_")" != "" ]
   then
-    infoAction "Company naming convention" "$I1"
+    infoAction "    Company naming convention" "$I1"
     CDB_NAME=$(echo $TARGETCONTAINERDATABASE_CONNECTIONDETAILS_SERVICENAME | sed -e "s;_.*$;;")
     CDB_UNIQUE_NAME=$TARGETCONTAINERDATABASE_CONNECTIONDETAILS_SERVICENAME
   elif [[ $TARGETCONTAINERDATABASE_CONNECTIONDETAILS_SERVICENAME =~ ^C.*M[0-9]*$ ]]
   then
-    infoAction "Company naming convention" "$I1"
+    infoAction "    Company naming convention" "$I1"
     CDB_NAME=$(echo $TARGETCONTAINERDATABASE_CONNECTIONDETAILS_SERVICENAME | sed -e "s;M[0-9]*$;;")
     CDB_UNIQUE_NAME=$TARGETCONTAINERDATABASE_CONNECTIONDETAILS_SERVICENAME
   else
@@ -451,8 +451,8 @@ touch $TMPFILE
     CDB_UNIQUE_NAME=$TARGETCONTAINERDATABASE_CONNECTIONDETAILS_SERVICENAME
   fi
 
-  infoAction "Database              : $CDB_NAME" "$I1"
-  infoAction "Database unique name  : $CDB_UNIQUE_NAME" "$I1"
+  infoAction "    Database              : $CDB_NAME" "$I1"
+  infoAction "    Database unique name  : $CDB_UNIQUE_NAME" "$I1"
 
   EMCTL=/u02/app/oracle/oem/agent/agent_inst/bin/emctl
   startStep "$ACTION a blackout for a database ($CDB_NAME)"

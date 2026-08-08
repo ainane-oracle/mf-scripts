@@ -491,7 +491,7 @@ mf_oem_print_inspection()
              end)
        else ""
        end))
-  ' "$inspection_file" | sed 's/^/      /' || mf_oem_error "Unable to format OEM blackout status"
+  ' "$inspection_file" | sed 's/^/         /' || mf_oem_error "Unable to format OEM blackout status"
 }
 
 mf_oem_validate_topology()
