@@ -127,17 +127,16 @@ fi
 [ "$MF_BYPASS_MLS" = "" ]   && export MF_BYPASS_MLS=N         # Allow a script to run even if MILESTONE control is not O       --> Y|N
 
 # OEM 13.5 REST configuration used by mfEmBlackout.sh only when -r is supplied.
-# Temporary deployment model: set username and password here in plain text.
-# Replace this with protected secret retrieval in the planned security update.
+# The OEM username is MF_BLACKOUT. Its password is retrieved at runtime from
+# the KeePass entry WEB_USER|OEM_REST_API and must never be stored here.
 export MF_OEM_API_BASE_URL=${MF_OEM_API_BASE_URL:-}                         # HTTPS origin, for example https://oms.example:7803
-export MF_OEM_API_USERNAME=${MF_OEM_API_USERNAME:-}                         # Plain-text OEM username placeholder
-export MF_OEM_API_PASSWORD=${MF_OEM_API_PASSWORD:-}                         # Plain-text OEM password placeholder
 export MF_OEM_BLACKOUT_REASON_ID=${MF_OEM_BLACKOUT_REASON_ID:-29}
 export MF_OEM_BLACKOUT_ALLOW_JOBS=${MF_OEM_BLACKOUT_ALLOW_JOBS:-true}       # true|false
 export MF_OEM_VERIFY_ATTEMPTS=${MF_OEM_VERIFY_ATTEMPTS:-12}
 export MF_OEM_VERIFY_INTERVAL=${MF_OEM_VERIFY_INTERVAL:-5}                   # Seconds between asynchronous action checks
+export MF_OEM_STOP_PENDING_TIMEOUT=${MF_OEM_STOP_PENDING_TIMEOUT:-300}       # START waits up to five minutes before declaring STOP_PENDING stuck
 export MF_OEM_CA_CERT=${MF_OEM_CA_CERT:-}                                   # Optional PEM CA bundle; TLS verification is never disabled
-export MF_OEM_BLACKOUT_STATE_DIR=${MF_OEM_BLACKOUT_STATE_DIR:-}             # Defaults to $MF_DATA/em_blackouts
+
  
 if [ -f $MF_BIN/mfSpecificFunctions.BNP.sh ]
 then
@@ -148,6 +147,3 @@ fi
 #    Must end in success
 #
 true
-
-
-

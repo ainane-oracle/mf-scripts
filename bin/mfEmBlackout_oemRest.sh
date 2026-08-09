@@ -8,10 +8,11 @@
 #               is evaluated for that blackout ID only; coverage is never
 #               combined across IDs.
 #
-# Security    : HTTPS is mandatory. Basic authentication is supplied to curl
-#               through stdin, temporary files are mode 600, pagination links
-#               are restricted to the configured OEM origin, and blackout IDs
-#               are validated before use in request paths.
+# Security    : HTTPS is mandatory. The OEM password is read from the existing
+#               Migration Factory KeePass store. Basic authentication is
+#               supplied to curl through stdin, temporary files are mode 600,
+#               pagination links are restricted to the configured OEM origin,
+#               and blackout IDs are validated before use in request paths.
 # -----------------------------------------------------------------------------
 
 declare -a MF_OEM_TMP_FILES=()
@@ -49,13 +50,40 @@ mf_oem_require_command()
   command -v "$1" >/dev/null 2>&1 || mf_oem_error "Required command is not available: $1"
 }
 
+mf_oem_load_credentials()
+{
+  local password_type=WEB_USER
+  local password_id=OEM_REST_API
+
+  # The OEM account is deployment-wide. Only its password is stored in
+  # KeePass, under the existing Migration Factory TYPE|ID convention.
+  MF_OEM_API_USERNAME=MF_BLACKOUT
+  unset MF_OEM_API_PASSWORD
+
+  [ "${MF_PASSWORD_STORE:-}" = "KEEPASS" ] \
+    || mf_oem_error "MF_PASSWORD_STORE must be KEEPASS for OEM REST authentication" || return 1
+  declare -F isPasswordStored >/dev/null 2>&1 \
+    || mf_oem_error "KeePass existence check is not available" || return 1
+  declare -F getSecretPassword >/dev/null 2>&1 \
+    || mf_oem_error "KeePass password retrieval is not available" || return 1
+
+  isPasswordStored "$password_type" "$password_id" \
+    || mf_oem_error "OEM password entry ${password_type}|${password_id} is missing from KeePass" || return 1
+
+  # getSecretPassword can emit secret values through the shared MF_DEBUG
+  # path. Disable that debug path only for this retrieval.
+  MF_OEM_API_PASSWORD=$(MF_DEBUG=N getSecretPassword "$password_type" "$password_id") \
+    || mf_oem_error "Unable to retrieve OEM password from KeePass entry ${password_type}|${password_id}" || return 1
+  [ -n "$MF_OEM_API_PASSWORD" ] \
+    || mf_oem_error "KeePass returned an empty OEM password" || return 1
+}
+
 mf_oem_validate_config()
 {
   [ -n "${MF_OEM_API_BASE_URL:-}" ] || mf_oem_error "MF_OEM_API_BASE_URL is required" || return 1
-  [ -n "${MF_OEM_API_USERNAME:-}" ] || mf_oem_error "MF_OEM_API_USERNAME is required" || return 1
-  [ -n "${MF_OEM_API_PASSWORD:-}" ] || mf_oem_error "MF_OEM_API_PASSWORD is required" || return 1
   [[ "$MF_OEM_API_BASE_URL" =~ ^https://([A-Za-z0-9._-]+|\[[0-9A-Fa-f:]+\])(:[0-9]+)?/?$ ]] \
     || mf_oem_error "MF_OEM_API_BASE_URL must be an HTTPS origin without a path" || return 1
+  mf_oem_load_credentials || return 1
 
   MF_OEM_API_BASE_URL=${MF_OEM_API_BASE_URL%/}
   MF_OEM_BLACKOUT_REASON_ID=${MF_OEM_BLACKOUT_REASON_ID:-29}
@@ -225,6 +253,7 @@ mf_oem_cleanup()
     [ -n "$file" ] && rm -f -- "$file"
   done
   MF_OEM_TMP_FILES=()
+  unset MF_OEM_API_PASSWORD
 }
 
 mf_oem_fetch_target_pages()
