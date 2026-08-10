@@ -15,7 +15,7 @@
 #
 # *****************************************************************************
 
-VERSION=1.16
+VERSION=1.15
 # ************************************************************************** 
 # Modifications :
 # =============
@@ -35,9 +35,7 @@ VERSION=1.16
 # 08/08/2026 AIN - Version 1.14, simplify REST blackouts to one canonical ID,
 #                  duration-based START, non-blocking STOP, and START-owned
 #                  terminal cleanup before canonical-name reuse.
-# 10/08/2026 AIN - Version 1.15, retain -r as the explicit centralized OEM
-#                  REST selection while keeping the legacy default unchanged.
-# 10/08/2026 AIN - Version 1.16, make a REST START without -d end at the
+# 10/08/2026 AIN - Version 1.15, make a REST START without -d end at the
 #                  planned GO-LIVE start plus two hours.
 #
 # ************************************************************************** 
