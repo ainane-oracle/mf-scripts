@@ -15,7 +15,7 @@
 #
 # *****************************************************************************
 
-VERSION=1.14
+VERSION=1.16
 # ************************************************************************** 
 # Modifications :
 # =============
@@ -35,6 +35,10 @@ VERSION=1.14
 # 08/08/2026 AIN - Version 1.14, simplify REST blackouts to one canonical ID,
 #                  duration-based START, non-blocking STOP, and START-owned
 #                  terminal cleanup before canonical-name reuse.
+# 10/08/2026 AIN - Version 1.15, retain -r as the explicit centralized OEM
+#                  REST selection while keeping the legacy default unchanged.
+# 10/08/2026 AIN - Version 1.16, make a REST START without -d end at the
+#                  planned GO-LIVE start plus two hours.
 #
 # ************************************************************************** 
 SCRIPT_LIB="Migration Factory 2.0 : Manage EM blackouts for a target database"
@@ -266,8 +270,10 @@ Options:
                              (monitoring alerts are not raised) - STOP : Removes the.
                              blackout (monitoring alerts will resume) - STATUS : Show the.
                              status of the blackout - IS_ON : returns 0 if Blackout is ON.
-  -d duration            : START duration, format [D] HH:MI [DEFAULT: 12h].
-                             REST translates it to durationHours/durationMinutes.
+  -d duration            : Explicit START duration, format [D] HH:MI.
+                             Without -d, REST uses planned GO-LIVE + 2h; local
+                             emctl retains its 12h default. REST translates it
+                             to durationHours/durationMinutes.
   -r                     : Use the centralized OEM REST API for the selected action.
                              Without -r, all actions retain local emctl behavior.
   -Q                     : Quiet mode (remove progress output).
@@ -279,6 +285,7 @@ Options:
 Examples:
   $(basename "$0") -m MIGRATION_ID
   $(basename "$0") -m MIGRATION_ID -A START -d 02:00
+  $(basename "$0") -m MIGRATION_ID -r -A START
   $(basename "$0") -m MIGRATION_ID -r -A START -d 02:00
   $(basename "$0") -m MIGRATION_ID -r -A STATUS
 
@@ -347,6 +354,7 @@ touch $TMPFILE
   MF_MIGRATION_ID=""                         # Mandatory to pass as argument
   ACTION=START
   DURATION="12:00"
+  DURATION_EXPLICIT=N
   USE_REST_API=N
   toShift=0
   while getopts :m:A:d:rQVnh opt
@@ -354,7 +362,7 @@ touch $TMPFILE
     case $opt in
      # --------- Script parameters ---------------------------------------------
      A) ACTION=${OPTARG^^}                            ; toShift=$(($toShift + 2)) ;;
-     d) DURATION=${OPTARG^^}                          ; toShift=$(($toShift + 2)) ;;
+     d) DURATION=${OPTARG^^} ; DURATION_EXPLICIT=Y    ; toShift=$(($toShift + 2)) ;;
      r) USE_REST_API=Y                                ; toShift=$(($toShift + 1)) ;;
      # --------- Common parameters ---------------------------------------------
      Q) setVar LOG_QUIET                  Y           ; toShift=$(($toShift + 1)) ;;
@@ -453,6 +461,32 @@ touch $TMPFILE
 
   infoAction "    Database              : $CDB_NAME" "$I1"
   infoAction "    Database unique name  : $CDB_UNIQUE_NAME" "$I1"
+
+  # A REST START without an explicit -d follows the planned migration window.
+  # Keep -d authoritative for shorter maintenance actions such as a rolling
+  # restart, and keep the legacy local-emctl default unchanged.
+  if [ "$USE_REST_API" = "Y" ] && [ "$ACTION" = "START" ] && [ "$DURATION_EXPLICIT" != "Y" ]
+  then
+    DURATION=$(exec_sql "$MF_REPO_CONNECT" "
+      select case
+        when count(*) != 1 then null
+        when min(target_date) <= sysdate then '02:00'
+        else
+          case
+            when (min(target_date) + interval '2' hour - sysdate) < 1 then ''
+            else to_char(trunc(min(target_date) + interval '2' hour - sysdate)) || ' '
+          end ||
+          to_char(trunc(mod((min(target_date) + interval '2' hour - sysdate) * 24, 24)), 'FM00') || ':' ||
+          to_char(trunc(mod((min(target_date) + interval '2' hour - sysdate) * 24 * 60, 60)), 'FM00')
+      end
+      from migration_planned_operations po
+      where po.mig_id = '$MFAUTO_MIG_ID'
+        and po.mls_id = mf_mig_parameters.get_id('MLS_ID_GOLIVE_START', po.prj_name)
+        and po.current_plan = 'Y';")
+    [ "$DURATION" != "" ] \
+      || die "Unable to derive blackout duration from one planned GO-LIVE start"
+    infoAction "    REST duration         : $DURATION (planned GO-LIVE + 2 hours)" "$I1"
+  fi
 
   EMCTL=/u02/app/oracle/oem/agent/agent_inst/bin/emctl
   startStep "$ACTION a blackout for a database ($CDB_NAME)"

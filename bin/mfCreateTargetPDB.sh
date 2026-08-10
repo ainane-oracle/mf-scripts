@@ -721,60 +721,22 @@ mfSetEnvFile
   #   Setting up the blackout
   #
   #infoAction "Setting blackout for target database : $CDB_UNIQUE_NAME" "$I2" 
-  #.$SCRIPT_DIR/mfEmBlackout.sh -m $MF_MIGRATION_ID -A start
+  #.$SCRIPT_DIR/mfEmBlackout.sh -m $MF_MIGRATION_ID -r -A start
   mfRepo_updateProgress BLACKOUT
   libAction "Testing if database is under blackout" "$I1"
-  if ! $MF_BIN/mfEmBlackout.sh -m $MF_MIGRATION_ID -A IS_ON -n </dev/null >/dev/null 2>&1
+  if ! $MF_BIN/mfEmBlackout.sh -m $MF_MIGRATION_ID -r -A IS_ON -n </dev/null >/dev/null 2>&1
   then
     echo "No Blackout"
-    blackoutDuration=$(exec_sql "$MF_REPO_CONNECT" "select
-      case
-        when target_date <= sysdate then '02:00'
-        else
-          case
-            when (target_date + INTERVAL '2' HOUR - sysdate) < 1 then
-              -- less than 1 day left
-              ''
-            else
-              to_char(trunc(target_date + INTERVAL '2' HOUR - sysdate)) || ' '
-          end || to_char(trunc(mod((target_date + INTERVAL '2' HOUR - sysdate) * 24, 24)), 'FM00') || ':' || to_char(trunc(mod((target_date + INTERVAL '2' HOUR - sysdate) * 24 * 60, 60)), 'FM00')
-      end as blackout_duration
-    from
-        migration_planned_operations po
-        --join migration_attempts ma on (ma.mig_id = po.mig_id and current_attempt='Y')
-    where
-        po.mig_id = '$MFAUTO_MIG_ID'
-        and po.mls_id = mf_mig_parameters.get_id('MLS_ID_GOLIVE_START',po.prj_name)
-        and po.current_plan='Y';");
-    blackoutFormattedDuration=$(exec_sql "$MF_REPO_CONNECT" "select
-        case
-          when target_date <= sysdate then '02:00'
-          else
-            case
-              when (target_date + INTERVAL '2' HOUR - sysdate) < 1 then
-                -- less than 1 day left
-                ''
-              else
-                to_char(trunc(target_date + INTERVAL '2' HOUR - sysdate)) || ' days '
-            end || to_char(trunc(mod((target_date + INTERVAL '2' HOUR - sysdate) * 24, 24))) || ' hours ' || to_char(trunc(mod((target_date + INTERVAL '2' HOUR - sysdate) * 24 * 60, 60))) || ' minutes'
-        end as formatted_delay
-      from
-          migration_planned_operations po
-          --join migration_attempts ma on (ma.mig_id = po.mig_id and current_attempt='Y')
-      where
-          po.mig_id = '$MFAUTO_MIG_ID'
-          and po.mls_id = mf_mig_parameters.get_id('MLS_ID_GOLIVE_START',po.prj_name)
-          and po.current_plan='Y';");
-    libAction "Start Blackout ($blackoutDuration), until : $(date -d "now + $blackoutFormattedDuration")"  "$I2"
+    libAction "Start blackout until planned GO-LIVE + 2 hours" "$I2"
     
-    if $MF_BIN/mfEmBlackout.sh -m $MF_MIGRATION_ID -A START -d "$blackoutDuration" -n </dev/null >/dev/null 2>&1
+    if $MF_BIN/mfEmBlackout.sh -m $MF_MIGRATION_ID -r -A START -n </dev/null >/dev/null 2>&1
     then
       echo Ok
     else
       echo Error
       die "Unable to create blackout"
     fi
-    # $MF_BIN/mfEmBlackout.sh -m $MF_MIGRATION_ID -A IS_ON -n </dev/null >/dev/null 2>&1 || die "Blackout not active (error creating it)"
+    # $MF_BIN/mfEmBlackout.sh -m $MF_MIGRATION_ID -r -A IS_ON -n </dev/null >/dev/null 2>&1 || die "Blackout not active (error creating it)"
   else
     echo "Active blackout"
   fi
