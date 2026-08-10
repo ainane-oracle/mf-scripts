@@ -438,6 +438,7 @@ mf_oem_inspect_exact_blackouts()
         ] | index($status) != null) ] | length),
         candidates: $candidates[0],
         expectedTargets: $expected[0],
+        actualTargets: [],
         exactTargetIds: false
       }
     ' > "$output_file" || mf_oem_error "Unable to describe OEM blackout candidates"
@@ -487,6 +488,7 @@ mf_oem_inspect_exact_blackouts()
         candidates: $candidates[0],
         blackoutId: $detail[0].id,
         status: $detail[0].status,
+        endTime: ($detail[0].creationTimeToEnd // $detail[0].timeToEnd // null),
         active: $active,
         terminal: $terminal,
         expectedTargets: $expected[0],
@@ -499,27 +501,26 @@ mf_oem_inspect_exact_blackouts()
 mf_oem_print_inspection()
 {
   local inspection_file="$1"
-  jq -r --arg name "$(mf_oem_blackout_name)" '
-    def count_type($items; $type): [$items[] | select(.typeName == $type)] | length;
+  jq -r '
     . as $inspection |
+    ($inspection.expectedTargets | length) as $discovered |
+    ($inspection.actualTargets | length) as $covered |
     (if $inspection.candidateCount == 0
-     then "Blackout situation    : no existing blackout found"
-     elif $inspection.candidateCount == 1
-     then "Blackout situation    : existing blackout found"
-     else "Blackout situation    : ambiguous; multiple existing blackouts found"
-     end),
-    (if $inspection.candidateCount == 1 then "Blackout ID            : \($inspection.blackoutId)" else empty end),
-    (if $inspection.candidateCount == 1 then "Blackout status        : \($inspection.status)" else empty end),
-    ("Target coverage       : \($inspection.expectedTargets | length) discovered targets" +
-      (if $inspection.candidateCount == 1
-       then (if $inspection.terminal
-             then "; coverage was not checked during terminal cleanup"
-             elif $inspection.exactTargetIds
-             then "; all discovered targets are covered"
-             else "; not all discovered targets are covered"
-             end)
-       else ""
-       end))
+     then "Blackout situation    : \($discovered) discovered targets; 0 targets covered by the canonical blackout.",
+          "Action required       : no canonical blackout exists; use START to create one."
+     elif $inspection.candidateCount > 1
+     then "Blackout situation    : ambiguous; multiple canonical blackouts were found.",
+          "Action required       : resolve the duplicate blackouts before using START."
+     elif $inspection.terminal
+     then "Blackout situation    : terminal blackout found with status \($inspection.status).",
+          "Action required       : use START to clean up the terminal blackout and create a new one."
+     elif $inspection.exactTargetIds
+     then "Blackout situation    : all \($discovered) discovered targets are covered by the blackout.",
+          "Blackout status       : \($inspection.status)",
+          "Blackout will end at  : \($inspection.endTime // \"not returned by OEM\")"
+     else "Blackout situation    : \($discovered) discovered targets; \($covered) targets covered by the canonical blackout.",
+          "Action required       : coverage is incomplete; resolve the canonical blackout before using START."
+     end)
   ' "$inspection_file" | sed 's/^/         /' || mf_oem_error "Unable to format OEM blackout status"
 }
 
@@ -893,6 +894,39 @@ mf_oem_print_blackout()
   ' "$response_file" || mf_oem_error "Unable to format OEM blackout status"
 }
 
+mf_oem_print_start_result()
+{
+  local response_file="$1"
+  local target_count="$2"
+  local status end_time
+
+  status=$(jq -r '.status' "$response_file") || return 1
+  end_time=$(jq -r '.creationTimeToEnd // .timeToEnd // "not returned by OEM"' "$response_file") || return 1
+  if [ "$status" = "SCHEDULED" ]
+  then
+    mf_oem_warning "Blackout has been SCHEDULED; $target_count discovered targets are registered, but monitoring is not yet suppressed."
+  else
+    printf '         Blackout has been %s; all %s discovered targets are covered.\n' "$status" "$target_count"
+  fi
+  printf '         Blackout will end at  : %s\n' "$end_time"
+}
+
+mf_oem_print_existing_start_result()
+{
+  local inspection_file="$1"
+  local status end_time
+
+  status=$(jq -r '.status' "$inspection_file") || return 1
+  end_time=$(jq -r '.endTime // "not returned by OEM"' "$inspection_file") || return 1
+  if [ "$status" = "SCHEDULED" ]
+  then
+    mf_oem_warning 'Blackout is already SCHEDULED; all discovered targets are registered, but monitoring is not yet suppressed.'
+  else
+    printf '         Blackout is already %s; all discovered targets are covered.\n' "$status"
+  fi
+  printf '         Blackout will end at  : %s\n' "$end_time"
+}
+
 mf_oem_prepare_inspection()
 {
   local repository_migration_id="$1"
@@ -944,8 +978,6 @@ mf_oem_start_blackout()
     [ "${MF_OEM_EXACT_CANDIDATE_COUNT:-0}" -gt 0 ] && return 3
     return 1
   fi
-  mf_oem_print_inspection "$inspection_file" || return 1
-
   candidate_count=$(jq '.candidateCount' "$inspection_file") || return 1
   if [ "$candidate_count" -eq 1 ]
   then
@@ -957,12 +989,7 @@ mf_oem_start_blackout()
          .exactTargetIds
         ' "$inspection_file" >/dev/null
         then
-          if [ "$status" = "SCHEDULED" ]
-          then
-            mf_oem_log 'START accepted as SCHEDULED; all discovered targets are covered, but ON is not yet confirmed.'
-          else
-            mf_oem_log 'Blackout is already STARTED with all discovered targets covered; no new blackout was created.'
-          fi
+          mf_oem_print_existing_start_result "$inspection_file" || return 1
           return 0
         fi
         mf_oem_error "The exact canonical OEM blackout is incomplete in accepted START state $status"
@@ -1024,7 +1051,7 @@ mf_oem_start_blackout()
   mf_oem_verify_blackout_targets "$blackout_id" "$targets_file" || return 1
   status=$(jq -r '.status' "$response_file") || return 1
 
-  mf_oem_log "Blackout created: id=$blackout_id, status=$status, duration=$duration, targets=$(jq 'length' "$targets_file")"
+  mf_oem_print_start_result "$response_file" "$(jq 'length' "$targets_file")"
 }
 
 mf_oem_status_blackout()
@@ -1133,8 +1160,6 @@ mf_oem_stop_blackout()
     [ "${MF_OEM_EXACT_CANDIDATE_COUNT:-0}" -gt 0 ] && return 3
     return 1
   fi
-  mf_oem_print_inspection "$inspection_file" || return 1
-
   candidate_count=$(jq '.candidateCount' "$inspection_file") || return 1
   if [ "$candidate_count" -eq 0 ]
   then
@@ -1152,12 +1177,13 @@ mf_oem_stop_blackout()
 
   case "$status" in
     STOPPED|ENDED)
-      printf 'OEM blackout %s is already %s; STOP is complete and START will clean up the terminal definition when needed.\n' \
-        "$blackout_id" "$status"
+      printf '         Blackout has been %s.\n' "$status"
+      printf '%s\n' '         Terminal cleanup is deferred to a later START; no DELETE was attempted.'
       return 0
       ;;
     STOP_PENDING)
-      mf_oem_warning "Blackout $blackout_id is already STOP_PENDING; STOP remains non-blocking."
+      mf_oem_warning 'Blackout has been STOP_PENDING; STOP remains non-blocking.'
+      printf '%s\n' '         Terminal cleanup is deferred to a later START.'
       return 0
       ;;
   esac
@@ -1185,16 +1211,18 @@ mf_oem_stop_blackout()
       MF_OEM_MUTATION_ATTEMPTED=Y
       mf_oem_http POST "${MF_OEM_API_BASE_URL}/em/api/blackouts/${blackout_id}/actions/stop" "$stop_file" || return 1
       mf_oem_expect_http "$MF_OEM_HTTP_STATUS" 204 "Blackout stop" || return 1
-      printf 'OEM blackout stop accepted: %s; terminal cleanup is deferred to a later START.\n' "$blackout_id"
+      printf '%s\n' '         Blackout has been requested to stop; status is now STOP_PENDING.'
+      printf '%s\n' '         Terminal cleanup is deferred to a later START.'
       return 0
       ;;
     STOP_PENDING)
-      mf_oem_warning "Blackout $blackout_id became STOP_PENDING; STOP remains non-blocking."
+      mf_oem_warning 'Blackout has been STOP_PENDING; STOP remains non-blocking.'
+      printf '%s\n' '         Terminal cleanup is deferred to a later START.'
       return 0
       ;;
     STOPPED|ENDED)
-      printf 'OEM blackout %s reached %s; STOP is complete and no DELETE was attempted.\n' \
-        "$blackout_id" "$status"
+      printf '         Blackout has been %s.\n' "$status"
+      printf '%s\n' '         Terminal cleanup is deferred to a later START; no DELETE was attempted.'
       return 0
       ;;
     *)
