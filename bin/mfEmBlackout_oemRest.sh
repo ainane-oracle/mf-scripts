@@ -501,7 +501,11 @@ mf_oem_inspect_exact_blackouts()
 mf_oem_print_inspection()
 {
   local inspection_file="$1"
-  jq -r '
+  local end_time
+
+  end_time=$(jq -r '.endTime // empty' "$inspection_file") || return 1
+  end_time=$(mf_oem_format_utc "$end_time") || return 1
+  jq -r --arg end_time "$end_time" '
     . as $inspection |
     ($inspection.expectedTargets | length) as $discovered |
     ($inspection.actualTargets | length) as $covered |
@@ -517,11 +521,20 @@ mf_oem_print_inspection()
      elif $inspection.exactTargetIds
      then "Blackout situation    : all \($discovered) discovered targets are covered by the blackout.",
           "Blackout status       : \($inspection.status)",
-          "Blackout will end at  : \($inspection.endTime // \"not returned by OEM\")"
+           "Blackout will end at (UTC): \($end_time)"
      else "Blackout situation    : \($discovered) discovered targets; \($covered) targets covered by the canonical blackout.",
           "Action required       : coverage is incomplete; resolve the canonical blackout before using START."
      end)
   ' "$inspection_file" | sed 's/^/         /' || mf_oem_error "Unable to format OEM blackout status"
+}
+
+mf_oem_format_utc()
+{
+  local end_time="$1"
+
+  [ "$end_time" != "" ] || { printf '%s\n' 'not returned by OEM'; return 0; }
+  date -u -d "$end_time" '+%Y-%m-%dT%H:%MZ' 2>/dev/null \
+    || printf '%s\n' "$end_time"
 }
 
 mf_oem_validate_topology()
@@ -901,14 +914,15 @@ mf_oem_print_start_result()
   local status end_time
 
   status=$(jq -r '.status' "$response_file") || return 1
-  end_time=$(jq -r '.creationTimeToEnd // .timeToEnd // "not returned by OEM"' "$response_file") || return 1
+  end_time=$(jq -r '.creationTimeToEnd // .timeToEnd // empty' "$response_file") || return 1
+  end_time=$(mf_oem_format_utc "$end_time") || return 1
   if [ "$status" = "SCHEDULED" ]
   then
     mf_oem_warning "Blackout has been SCHEDULED; $target_count discovered targets are registered, but monitoring is not yet suppressed."
   else
     printf '         Blackout has been %s; all %s discovered targets are covered.\n' "$status" "$target_count"
   fi
-  printf '         Blackout will end at  : %s\n' "$end_time"
+  printf '         Blackout will end at (UTC): %s\n' "$end_time"
 }
 
 mf_oem_print_existing_start_result()
@@ -917,14 +931,15 @@ mf_oem_print_existing_start_result()
   local status end_time
 
   status=$(jq -r '.status' "$inspection_file") || return 1
-  end_time=$(jq -r '.endTime // "not returned by OEM"' "$inspection_file") || return 1
+  end_time=$(jq -r '.endTime // empty' "$inspection_file") || return 1
+  end_time=$(mf_oem_format_utc "$end_time") || return 1
   if [ "$status" = "SCHEDULED" ]
   then
     mf_oem_warning 'Blackout is already SCHEDULED; all discovered targets are registered, but monitoring is not yet suppressed.'
   else
     printf '         Blackout is already %s; all discovered targets are covered.\n' "$status"
   fi
-  printf '         Blackout will end at  : %s\n' "$end_time"
+  printf '         Blackout will end at (UTC): %s\n' "$end_time"
 }
 
 mf_oem_prepare_inspection()
