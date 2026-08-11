@@ -16,6 +16,7 @@ MF_MIGRATE_HELPER=${MF_MIGRATE_HELPER:-$MF_MIGRATE_SCRIPT_DIR/mfEmBlackout_oemRe
 declare -a MF_MIGRATE_PLAN_FILES=()
 declare -a MF_MIGRATE_OWN_TMP_FILES=()
 MF_MIGRATE_LOCK_FD=
+MF_MIGRATE_RESOLVED_MIGRATION_IDS=
 
 mf_migrate_error()
 {
@@ -37,10 +38,12 @@ Migrates active legacy blackouts named:
   MF_2_<CDB>_Migration_YYYYMMDD_HHMMSS
 
 Only STARTED blackouts ending strictly after the frozen run time plus N minutes
-are selected. N defaults to 1445 (tomorrow plus five minutes). Dry-run is the
-default. --apply creates or reuses the canonical blackout and then stops each
-verified legacy blackout. This script never deletes blackouts and never falls
-back to emctl.
+are selected. N defaults to 0, so the normal run selects active legacy
+blackouts from now. Dry-run is the default. --apply creates or reuses the
+canonical blackout with the current authoritative database, PDB, and RAC
+targets, ending at the planned GO-LIVE start plus two hours, and then stops
+each verified legacy blackout. This script never deletes blackouts and never
+falls back to emctl.
 
 For deterministic offline testing, MF_MIGRATE_NOW_EPOCH may be set to a Unix
 epoch. Production runs should leave it unset.
@@ -142,15 +145,13 @@ mf_migrate_validate_legacy_targets()
 {
   local targets_file="$1"
   jq -e '
-    type == "array" and length > 0 and
-    all(type == "object" and
-        (.id | type == "string" and length > 0) and
-        (.name | type == "string" and length > 0) and
-        (.typeName == "oracle_database" or .typeName == "oracle_pdb")) and
-    ([.[] | select(.typeName == "oracle_database")] | length) > 0 and
-    (group_by(.id) | all((map([.name, .typeName]) | unique | length) == 1))
+    type == "array" and length == 1 and
+    (.[0] | type == "object" and
+      (.id | type == "string" and length > 0) and
+      (.name | type == "string" and length > 0) and
+      .typeName == "oracle_database")
   ' "$targets_file" >/dev/null 2>&1 \
-    || mf_migrate_error 'A legacy blackout has missing, conflicting, or invalid target membership'
+    || mf_migrate_error 'A legacy blackout must have exactly one oracle_database target'
 }
 
 mf_migrate_append_candidate()
@@ -230,6 +231,48 @@ mf_migrate_collect_candidates()
     || mf_migrate_error 'OEM returned conflicting legacy blackout identities'
 }
 
+mf_migrate_duration_until_golive_plus_two_hours()
+{
+  local migration_ids="$1"
+  local duration
+
+  [[ "$migration_ids" =~ ^[0-9]+(,[0-9]+)*$ ]] \
+    || mf_migrate_error "Invalid Migration Factory migration IDs for GO-LIVE duration: $migration_ids" || return 1
+  duration=$(exec_sql "$MF_REPO_CONNECT" "
+    select case
+      when count(*) != 1 then null
+      when min(target_date) <= sysdate then '02:00'
+      else
+        case
+          when (min(target_date) + interval '2' hour - sysdate) < 1 then ''
+          else to_char(trunc(min(target_date) + interval '2' hour - sysdate)) || ' '
+        end ||
+        to_char(trunc(mod((min(target_date) + interval '2' hour - sysdate) * 24, 24)), 'FM00') || ':' ||
+        to_char(trunc(mod((min(target_date) + interval '2' hour - sysdate) * 24 * 60, 60)), 'FM00')
+    end
+    from migration_planned_operations po
+    where po.mig_id in ($migration_ids)
+      and po.mls_id = mf_mig_parameters.get_id('MLS_ID_GOLIVE_START', po.prj_name)
+      and po.current_plan = 'Y';") \
+    || mf_migrate_error "Unable to derive the planned GO-LIVE duration for migration IDs $migration_ids" || return 1
+  [ -n "$duration" ] \
+    || mf_migrate_error "Migration IDs $migration_ids do not have exactly one current planned GO-LIVE start" || return 1
+  mf_oem_parse_duration "$duration" >/dev/null || return 1
+  printf '%s\n' "$duration"
+}
+
+mf_migrate_duration_to_end_epoch()
+{
+  local duration="$1"
+  local now_epoch="$2"
+  local duration_parts hours minutes
+
+  duration_parts=$(mf_oem_parse_duration "$duration") || return 1
+  hours=${duration_parts%%|*}
+  minutes=${duration_parts#*|}
+  printf '%s\n' "$((now_epoch + hours * 3600 + minutes * 60))"
+}
+
 mf_migrate_service_cdb()
 {
   local service="${1^^}"
@@ -250,7 +293,9 @@ mf_migrate_resolve_authoritative_topology()
   local output_file="$2"
   local rows row migration_id service derived topology_file normalized signature
   local selected_file distinct_file
-  local match_count=0
+  local match_count=0 migration_ids=
+
+  MF_MIGRATE_RESOLVED_MIGRATION_IDS=
 
   rows=$(exec_sql "$MF_REPO_CONNECT" "
     select to_char(mig_id) || '|' || trim(target_container_service)
@@ -280,6 +325,10 @@ mf_migrate_resolve_authoritative_topology()
     [ "${derived^^}" = "${cdb^^}" ] || continue
 
     match_count=$((match_count + 1))
+    case ",$migration_ids," in
+      *",$migration_id,"*) ;;
+      *) migration_ids="${migration_ids:+$migration_ids,}$migration_id" ;;
+    esac
     mf_migrate_new_temp_file topology_file || return 1
     mf_oem_resolve_topology "$migration_id" "$cdb" "$service" "$topology_file" || return 1
     normalized=$(jq -c '{
@@ -300,7 +349,8 @@ mf_migrate_resolve_authoritative_topology()
   [ "$match_count" -gt 0 ] \
     || mf_migrate_error "No current Migration Factory attempt maps to CDB $cdb" || return 1
   [ "$(jq 'length' "$distinct_file")" -eq 1 ] \
-    || mf_migrate_error "Current Migration Factory attempts resolve conflicting topologies for CDB $cdb"
+    || mf_migrate_error "Current Migration Factory attempts resolve conflicting topologies for CDB $cdb" || return 1
+  MF_MIGRATE_RESOLVED_MIGRATION_IDS=$migration_ids
 }
 
 mf_migrate_legacy_targets_subset()
@@ -345,7 +395,7 @@ mf_migrate_validate_protected_canonical()
     || mf_migrate_error "Canonical blackout $canonical has no end time" || return 1
   end_epoch=$(mf_migrate_iso_to_epoch "$end_time") || return 1
   [ "$end_epoch" -ge "$required_end_epoch" ] \
-    || mf_migrate_error "Canonical blackout $canonical ends before the protected legacy interval" || return 1
+    || mf_migrate_error "Canonical blackout $canonical ends before planned GO-LIVE plus two hours" || return 1
   mf_migrate_new_temp_file actual_targets_file || return 1
   mf_oem_fetch_blackout_targets "$blackout_id" "$actual_targets_file" || return 1
   mf_oem_target_ids_equal "$expected_targets_file" "$actual_targets_file" \
@@ -360,7 +410,7 @@ mf_migrate_preflight_group()
   local now_epoch="$3"
   local plan_file="$4"
   local group_file topology_file discovered_file canonical_file detail_file targets_file
-  local canonical required_end_epoch count canonical_id action=CREATE canonical_end_time
+  local canonical required_end_epoch count canonical_id action=CREATE canonical_end_time duration
 
   mf_migrate_new_temp_file group_file || return 1
   jq --arg cdb "$cdb" '[.[] | select(.cdb == $cdb)] | sort_by(.id) | unique_by(.id)' \
@@ -368,14 +418,11 @@ mf_migrate_preflight_group()
   canonical=$(jq -er '.[0].canonicalName' "$group_file") || return 1
   [ "$(jq '[.[].canonicalName] | unique | length' "$group_file")" -eq 1 ] \
     || mf_migrate_error "Legacy names for $cdb do not resolve one exact canonical name" || return 1
-  required_end_epoch=$(jq '[.[].endEpoch] | max' "$group_file") || return 1
-  canonical_end_time=$(jq -er --argjson end "$required_end_epoch" \
-    '[.[] | select(.endEpoch == $end)][0].endTime' "$group_file") || return 1
-  [ "$required_end_epoch" -gt "$now_epoch" ] \
-    || mf_migrate_error "Legacy interval for $cdb no longer ends in the future" || return 1
-
   mf_migrate_new_temp_file topology_file || return 1
   mf_migrate_resolve_authoritative_topology "$cdb" "$topology_file" || return 1
+  duration=$(mf_migrate_duration_until_golive_plus_two_hours "$MF_MIGRATE_RESOLVED_MIGRATION_IDS") || return 1
+  required_end_epoch=$(mf_migrate_duration_to_end_epoch "$duration" "$now_epoch") || return 1
+  canonical_end_time=$(mf_migrate_epoch_to_iso "$required_end_epoch") || return 1
   mf_migrate_new_temp_file discovered_file || return 1
   mf_oem_discover_targets "$topology_file" "$discovered_file" || return 1
   mf_migrate_legacy_targets_subset "$group_file" "$discovered_file" || return 1
@@ -398,6 +445,7 @@ mf_migrate_preflight_group()
 
   jq -n --arg cdb "$cdb" --arg canonicalName "$canonical" --arg action "$action" \
     --arg canonicalId "${canonical_id:-}" --arg canonicalEndTime "$canonical_end_time" \
+    --arg duration "$duration" \
     --argjson nowEpoch "$now_epoch" \
     --argjson requiredEndEpoch "$required_end_epoch" \
     --slurpfile legacy "$group_file" --slurpfile topology "$topology_file" \
@@ -407,6 +455,7 @@ mf_migrate_preflight_group()
       action: $action,
       canonicalId: (if $canonicalId == "" then null else $canonicalId end),
       canonicalEndTime: $canonicalEndTime,
+      duration: $duration,
       nowEpoch: $nowEpoch,
       requiredEndEpoch: $requiredEndEpoch,
       legacy: $legacy[0],
@@ -418,15 +467,7 @@ mf_migrate_preflight_group()
 mf_migrate_duration_for_plan()
 {
   local plan_file="$1"
-  local now_epoch required_end seconds total_minutes hours minutes
-  now_epoch=$(jq '.nowEpoch' "$plan_file") || return 1
-  required_end=$(jq '.requiredEndEpoch' "$plan_file") || return 1
-  seconds=$((required_end - now_epoch))
-  [ "$seconds" -gt 0 ] || return 1
-  total_minutes=$(((seconds + 59) / 60))
-  hours=$((total_minutes / 60))
-  minutes=$((total_minutes % 60))
-  printf '%s:%02d\n' "$hours" "$minutes"
+  jq -er '.duration' "$plan_file" || return 1
 }
 
 mf_migrate_wait_for_created_started()
@@ -665,7 +706,7 @@ mf_migrate_print_plan()
   local plan_file="$1"
   jq -r '
     "CDB: \(.cdb)",
-    "  Canonical: action=\(.action) id=\(.canonicalId // "<create>") end=\(.canonicalEndTime)",
+    "  Canonical: action=\(.action) id=\(.canonicalId // "<create>") end=\(.canonicalEndTime) (planned GO-LIVE + 2h; duration=\(.duration))",
     (.legacy | sort_by(.id)[] |
       "  Legacy: id=\(.id) name=\(.name) end=\(.endTime)"),
     (.targets | sort_by(.id)[] |
@@ -719,7 +760,7 @@ mf_migrate_acquire_apply_lock()
 
 mf_migrate_run()
 {
-  local apply=N mode='' cutoff_minutes=1445 arg now_epoch cutoff_epoch candidates_file count
+  local apply=N mode='' cutoff_minutes=0 arg now_epoch cutoff_epoch candidates_file count
   local plan_file row stop_failures=0
 
   while [ "$#" -gt 0 ]

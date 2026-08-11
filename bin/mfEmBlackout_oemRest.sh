@@ -403,7 +403,7 @@ mf_oem_fetch_blackout_targets()
   mf_oem_fetch_target_pages \
     "${MF_OEM_API_BASE_URL}/em/api/blackouts/${blackout_id}/targets?limit=2000" \
     "/em/api/blackouts/${blackout_id}/targets" \
-    "oracle_database,oracle_pdb" "$output_file"
+    "oracle_database,oracle_pdb,rac_database" "$output_file"
 }
 
 mf_oem_target_ids_equal()
@@ -627,9 +627,9 @@ mf_oem_query_targets()
   local encoded url
 
   encoded=$(printf '%s' "$pattern" | mf_oem_urlencode) || return 1
-  url="${MF_OEM_API_BASE_URL}/em/api/targets?limit=100&typeName=oracle_database&typeName=oracle_pdb&nameMatches=${encoded}"
+  url="${MF_OEM_API_BASE_URL}/em/api/targets?limit=100&typeName=oracle_database&typeName=oracle_pdb&typeName=rac_database&nameMatches=${encoded}"
   mf_oem_fetch_target_pages "$url" "/em/api/targets" \
-    "oracle_database,oracle_pdb" "$output_file"
+    "oracle_database,oracle_pdb,rac_database" "$output_file"
 }
 
 mf_oem_filter_targets_by_topology()
@@ -678,7 +678,7 @@ mf_oem_validate_resolved_targets()
       type == "object" and
       (.id | type == "string" and length > 0) and
       (.name | type == "string" and length > 0) and
-      (.typeName == "oracle_database" or .typeName == "oracle_pdb") and
+      (.typeName == "oracle_database" or .typeName == "rac_database" or .typeName == "oracle_pdb") and
       (.member | type == "object") and
       (.member.clusterId | type == "string" and length > 0) and
       (.member.realName | type == "string" and length > 0)
@@ -694,11 +694,13 @@ mf_oem_validate_resolved_targets()
                  (.realName | ascii_downcase) == ($target.member.realName | ascii_downcase))
        ] | length) == 1
     )) and
-    # Every cluster must expose at least one database target. PDB targets are
-    # optional, but every discovered PDB remains in the authoritative ID set.
+    # Every cluster must expose at least one single-instance or RAC database
+    # target. PDB targets are optional, but every discovered PDB remains in the
+    # authoritative ID set.
     ($required.clusters | all(. as $cluster |
       ([ $resolved[] |
-         select(.member.clusterId == $cluster.clusterId and .typeName == "oracle_database") |
+          select(.member.clusterId == $cluster.clusterId and
+                 (.typeName == "oracle_database" or .typeName == "rac_database")) |
          .id
        ] | unique | length) >= 1
     )) and
