@@ -1,6 +1,18 @@
 # Migration Factory `bin` changelog
 
-## 2026-08-15 — `mfPDBCopy.sh` 1.8.1
+## 2026-08-18 - `mfStatistics.sh` - v1.9
+
+### Changed
+
+- `bin/mfStatistics.sh` now writes a warning and continues with the next schema
+  when `DBMS_STATS.GATHER_SCHEMA_STATS` reports the known `ORA-20011` approximate
+  NDV failure containing `qeaeMinmaxFastFIV:inputlen` `ORA-00600`.
+
+### Note
+
+- This is a targeted workaround for a probable Oracle Database internal bug.
+
+## 2026-08-15 - `mfPDBCopy.sh` - v1.8.1
 
 ### Fixed
 
@@ -36,15 +48,8 @@
 - Make PDB open-state tests RAC-aware by querying `GV$PDBS` rather than only the
   instance servicing the current connection.
 
-### Validation
+# 2026-08-12 - mf_Utils_03_rspManagement.sh - v1.8
 
-- Added `tests/test_mfPDBCopy_hardening.sh` to verify the new fail-fast catalog
-  conversion behavior, datapatch error detection, plug-in violation checks,
-  serialized RAC open, and all-instance state persistence.
-- Applied the same `mfPDBCopy.sh` implementation to both `bin` and
-  `unstable_bin` to prevent behavior drift between deployment paths.
-
-# 2026-08-12
 Migration Factory fix – duplicate EXCLUDEOBJECTS-1 / PRGZ-3621
 During ZDM response-file generation, we identified an issue affecting table-only exclusions such as %OGG_BAD_COLS_YES%.
 When no OWNER: exclusion was configured, MF_ZDM_EXCLUDED_SCHEMAS was empty. The response generator retained the original blank template entry:
@@ -56,3 +61,59 @@ The fix changes the response generator so that the blank template entry is retai
 The correction was applied to the stable and unstable versions of mfUtils_03_rspManagement.sh. Change history was added with date 12/08/2026 and responsible AIN. Regression validation passed with 4/4 tests.
 This correction fixes the duplicate-number problem only. It does not permit combining INCLUDEOBJECTS and EXCLUDEOBJECTS; ZDM rejects that separate configuration with PRGT-1073. A migration must use either an include-only strategy or an exclusion-only strategy.
 
+## 2026-08-10 - OEM REST Blackout Changelog - v1.15
+
+### Scope
+
+This document records the OEM REST blackout feature delivered on branch
+
+### Implemented feature
+
+- `bin/mfEmBlackout.sh` supports `-r` to use the centralized OEM REST API for
+  `START`, `STOP`, `STATUS`, and `IS_ON`; without `-r`, the original local
+  `emctl` workflow remains unchanged.
+- `bin/mfEmBlackout_oemRest.sh` resolves Migration Factory attempt/peer-cluster
+  topology, discovers the authoritative OEM database/PDB targets, creates the
+  blackout through `/em/api/blackouts`, and verifies exact target-ID coverage.
+- One canonical name, `MF_2_<CDB>_Migration`, identifies the REST blackout.
+  Duplicate exact-name blackouts conflict; timestamp-suffixed legacy names are
+  ignored.
+- `START` reuses a complete `SCHEDULED` or `STARTED` blackout. It deletes a
+  terminal blackout, confirms its absence, and recreates the canonical name;
+  `-d` is translated to REST duration hours and minutes.
+- `STOP` submits the REST stop action for one verified `STARTED` blackout and
+  remains non-blocking. `STOP_PENDING` is a successful no-op; bounded terminal
+  cleanup is owned by the next `START` (`MF_OEM_STOP_PENDING_TIMEOUT`, 300s by
+  default).
+- `IS_ON` reports ON only for one `STARTED` canonical blackout covering every
+  discovered target; `STATUS` reports the inspected state and coverage.
+
+### Decisions and safeguards
+
+- REST is opt-in to preserve existing local-agent behavior, names, durations,
+  and fallback paths.
+- Local `emctl` fallback is permitted only before a REST mutation and only when
+  no exact canonical candidate requires verification. An uncertain create,
+  stop, or delete response blocks fallback to avoid conflicting blackouts.
+- Target discovery fails closed for missing, ambiguous, conflicting, or
+  incomplete topology/target data. Coverage is checked against one exact ID,
+  never by unioning multiple blackouts.
+- REST requires HTTPS (`MF_OEM_API_BASE_URL`), TLS verification (optionally
+  `MF_OEM_CA_CERT`), and `curl`, `jq`, and `base64`. Pagination is bounded and
+  restricted to the configured OEM origin.
+- The existing KeePass store supplies the `MF_BLACKOUT` account password.
+  Credentials are passed to `curl` through stdin; temporary files are mode 600
+  and cleanup removes them and unsets the password.
+
+### Operational workflow
+
+1. Select REST explicitly, for example:
+   `mfEmBlackout.sh -m <migration-id> -r -A START -d 02:00`.
+2. The script validates configuration and credentials, resolves topology, and
+   discovers matching OEM targets.
+3. It inspects the canonical blackout and validates one candidate's state and
+   exact target IDs before mutating OEM.
+4. `START` reuses, safely clears, or creates-and-verifies a blackout. `STOP`
+   submits the request and returns without polling or deletion.
+5. A safe pre-mutation REST failure can use the local `emctl` path; otherwise
+   the script fails or warns without issuing a contradictory local action.
