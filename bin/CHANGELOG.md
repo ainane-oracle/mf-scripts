@@ -1,5 +1,31 @@
 # Migration Factory `bin` changelog
 
+## 2026-09-16 - `mfEmBlackout_oemRest.sh` - v1.16
+
+### Changed
+
+- REST inspection now verifies every exact-name blackout independently by immutable
+  OEM ID, status, and exact target-ID coverage. `STOPPED` and `ENDED` records
+  are historical records for Migration Factory. They remain in OEM but do not
+  make the canonical blackout ambiguous and are never deleted by this flow.
+- `START` and `IS_ON` continue when one or more same-name `STARTED` blackouts
+  have exact coverage of the discovered target set. The log lists every
+  candidate ID and status and warns when duplicates or historical records exist.
+- `STOP` requests a stop for every verified same-name `STARTED` blackout with
+  exact target coverage. If any candidate is transitional, unsupported, or has
+  different coverage, STOP fails rather than leaving an uncertain result.
+
+### Accepted and blocked edge cases
+
+- Accepted with a warning: one or more `STARTED` blackouts with exact target
+  coverage, optionally alongside any number of `STOPPED` or `ENDED` records.
+- Accepted as no active blackout: only `STOPPED` or `ENDED` records exist.
+- Blocked: `SCHEDULED`, `STOP_PENDING`, edit, partial, failed, unknown, or
+  otherwise non-terminal same-name records coexist with duplicates. A STARTED
+  record that does not exactly match the discovered target set is also blocked.
+- The change does not extend, shorten, recreate, or physically delete an active
+  blackout to correct its end time. Duration management remains unchanged.
+
 ## 2026-08-18 - `mfStatistics.sh` - v1.9
 
 ### Changed

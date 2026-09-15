@@ -113,12 +113,13 @@ write_json "$TEST_TMP/targets-all.json" '[
   {"id":"pdb-1a","name":"exa1_CDBA_M1_APP","typeName":"oracle_pdb"},
   {"id":"pdb-1b","name":"exa1_CDBA_M1_AUDIT","typeName":"oracle_pdb"},
   {"id":"db-2","name":"exa2_CDBA_M2","typeName":"oracle_database"},
+  {"id":"rac-2","name":"exa2_CDBA_M2","typeName":"rac_database"},
   {"id":"pdb-2","name":"exa2_CDBA_M2_APP","typeName":"oracle_pdb"},
   {"id":"unrelated","name":"exa1_CDBA2_M1","typeName":"oracle_database"}
 ]'
 
 expect_success "multiple database targets per cluster and all discovered PDBs are retained" \
-  validate_discovery_fixture "$TEST_TMP/topology-two.json" "$TEST_TMP/targets-all.json" 7
+  validate_discovery_fixture "$TEST_TMP/topology-two.json" "$TEST_TMP/targets-all.json" 8
 
 mf_oem_filter_targets_by_topology "$TEST_TMP/topology-two.json" "$TEST_TMP/targets-all.json" \
   "$TEST_TMP/prefix-filter.json"
@@ -145,6 +146,12 @@ write_json "$TEST_TMP/targets-db-only.json" '[
 ]'
 expect_success "zero oracle_pdb targets is valid" \
   validate_discovery_fixture "$TEST_TMP/topology-one.json" "$TEST_TMP/targets-db-only.json" 2
+
+write_json "$TEST_TMP/targets-rac-only.json" '[
+  {"id":"rac-1","name":"exa1_CDBA_M1","typeName":"rac_database"}
+]'
+expect_success "a RAC database target satisfies required cluster coverage" \
+  validate_discovery_fixture "$TEST_TMP/topology-one.json" "$TEST_TMP/targets-rac-only.json" 1
 
 write_json "$TEST_TMP/targets-empty.json" '[]'
 expect_failure "empty discovery fails closed" \
@@ -180,7 +187,7 @@ expect_success "name and type may legitimately map to multiple authoritative IDs
 write_json "$TEST_TMP/targets-unsupported.json" '[
   {"id":"host-1","name":"exa1_CDBA_M1","typeName":"host"}
 ]'
-expect_failure "only oracle_database and oracle_pdb targets are accepted" \
+expect_failure "only oracle_database, rac_database, and oracle_pdb targets are accepted" \
   validate_discovery_fixture "$TEST_TMP/topology-one.json" "$TEST_TMP/targets-unsupported.json" 1
 
 expect_success "direct attempt/peer topology fixture is valid" \
@@ -194,6 +201,9 @@ expect_return "SCHEDULED is an accepted START result" 0 mf_oem_start_status_resu
 expect_return "STARTED is an accepted START result" 0 mf_oem_start_status_result STARTED
 expect_return "START_PROCESSING remains transitional" 2 mf_oem_start_status_result START_PROCESSING
 expect_failure "START_PARTIAL is a failed START result" mf_oem_start_status_result START_PARTIAL
+expect_success "STARTED is an accepted target reconciliation result" mf_oem_edit_status_result STARTED
+expect_return "EDIT_PENDING remains transitional" 2 mf_oem_edit_status_result EDIT_PENDING
+expect_failure "EDIT_PARTIAL is a failed target reconciliation result" mf_oem_edit_status_result EDIT_PARTIAL
 
 if [ "$(mf_oem_parse_duration '12:00')" = "12|0" ] \
    && [ "$(mf_oem_parse_duration '1 02:30')" = "26|30" ]
@@ -207,6 +217,7 @@ expect_failure "zero REST duration is rejected" mf_oem_parse_duration '00:00'
 
 write_json "$TEST_TMP/payload-targets.json" '[
   {"id":"db-1","name":"exa1_CDBA_M1","typeName":"oracle_database","member":{"clusterId":"1","realName":"exa1"}},
+  {"id":"rac-1","name":"exa1_CDBA_M1","typeName":"rac_database","member":{"clusterId":"1","realName":"exa1"}},
   {"id":"pdb-1","name":"exa1_CDBA_M1_APP","typeName":"oracle_pdb","member":{"clusterId":"1","realName":"exa1"}}
 ]'
 if mf_oem_build_payload MIG-42 "$TEST_TMP/payload-targets.json" '1 02:30' "$TEST_TMP/payload.json" \
@@ -215,12 +226,24 @@ if mf_oem_build_payload MIG-42 "$TEST_TMP/payload-targets.json" '1 02:30' "$TEST
         .durationHours == 26 and
         .durationMinutes == 30 and
         (has("timeToEnd") | not) and
-        .targets == [{"id":"db-1"},{"id":"pdb-1"}]
+         .targets == [{"id":"db-1"},{"id":"rac-1"},{"id":"pdb-1"}]
       ' "$TEST_TMP/payload.json" >/dev/null
 then
-  pass "REST payload uses canonical name, duration, and authoritative target IDs"
+  pass "REST payload includes database, RAC database, and PDB target IDs"
 else
-  fail "REST payload uses canonical name, duration, and authoritative target IDs"
+  fail "REST payload includes database, RAC database, and PDB target IDs"
+fi
+
+write_json "$TEST_TMP/start-result.json" \
+  '{"id":"BLACKOUT-1","name":"MF_2_CDBA_Migration","status":"STARTED","creationTimeToEnd":"2026-08-10T14:00+02:00"}'
+if mf_oem_print_start_result "$TEST_TMP/start-result.json" 4 > "$TEST_TMP/start-result.out" \
+   && [ "$(wc -l < "$TEST_TMP/start-result.out")" -eq 2 ] \
+   && grep -F 'Blackout has been STARTED; all 4 discovered targets are covered' "$TEST_TMP/start-result.out" >/dev/null \
+   && grep -F 'Blackout will end at (UTC): 2026-08-10T12:00Z' "$TEST_TMP/start-result.out" >/dev/null
+then
+  pass "START reports one status line and one OEM end-time line"
+else
+  fail "START reports one status line and one OEM end-time line"
 fi
 
 expect_success "HTTP 200 is accepted for GET" mf_oem_expect_http 200 200 "test request"
@@ -240,32 +263,78 @@ write_json "$TEST_TMP/candidates-zero.json" '[]'
 expect_success "zero exact-name candidates is represented without creating coverage" \
   mf_oem_inspect_exact_blackouts "$TEST_TMP/candidates-zero.json" "$TEST_TMP/expected.json" \
     "$TEST_TMP/inspection-zero.json"
+if mf_oem_print_inspection "$TEST_TMP/inspection-zero.json" > "$TEST_TMP/inspection-zero.out" \
+   && grep -F '2 discovered targets; 0 targets covered by the canonical blackout' "$TEST_TMP/inspection-zero.out" >/dev/null \
+   && grep -F 'no canonical blackout exists; use START to create one' "$TEST_TMP/inspection-zero.out" >/dev/null
+then
+  pass "STATUS explains missing canonical coverage and the START action"
+else
+  fail "STATUS explains missing canonical coverage and the START action"
+fi
 
+write_json "$TEST_TMP/actual-full.json" '[
+  {"id":"db-1","name":"renamed-display-value","typeName":"oracle_database"},
+  {"id":"pdb-1","name":"another-display-value","typeName":"oracle_pdb"}
+]'
 write_json "$TEST_TMP/candidates-duplicate.json" '[
   {"id":"BLACKOUT-A","name":"MF_2_CDBA_Migration","status":"STARTED","type":"PATCHING","owner":"mf"},
   {"id":"BLACKOUT-B","name":"MF_2_CDBA_Migration","status":"STARTED","type":"PATCHING","owner":"mf"}
 ]'
-if mf_oem_inspect_exact_blackouts "$TEST_TMP/candidates-duplicate.json" "$TEST_TMP/expected.json" \
-     "$TEST_TMP/inspection-duplicate.json" \
-   && jq -e '.candidateCount == 2 and .exactTargetIds == false and (has("coveredTargets") | not)' \
-        "$TEST_TMP/inspection-duplicate.json" >/dev/null
+write_json "$TEST_TMP/detail-blackout-a.json" \
+  '{"id":"BLACKOUT-A","name":"MF_2_CDBA_Migration","status":"STARTED","creationTimeToEnd":"2026-08-10T14:00+02:00"}'
+write_json "$TEST_TMP/detail-blackout-b.json" \
+  '{"id":"BLACKOUT-B","name":"MF_2_CDBA_Migration","status":"STARTED","creationTimeToEnd":"2026-08-10T14:00+02:00"}'
+if (
+  mf_oem_get_blackout() {
+    case "$1" in
+      BLACKOUT-A) cp "$TEST_TMP/detail-blackout-a.json" "$2" ;;
+      BLACKOUT-B) cp "$TEST_TMP/detail-blackout-b.json" "$2" ;;
+      *) return 1 ;;
+    esac
+  }
+  mf_oem_fetch_blackout_targets() { cp "$TEST_TMP/actual-full.json" "$2"; }
+  mf_oem_inspect_exact_blackouts "$TEST_TMP/candidates-duplicate.json" "$TEST_TMP/expected.json" \
+    "$TEST_TMP/inspection-duplicate.json"
+) && jq -e '.candidateCount == 2 and .startedCandidateCount == 2 and .exactStartedCandidateCount == 2 and .transitionalCandidateCount == 0' \
+      "$TEST_TMP/inspection-duplicate.json" >/dev/null
 then
-  pass "duplicate exact-name IDs conflict instead of contributing union coverage"
+  pass "duplicate STARTED IDs are independently verified without unioning coverage"
 else
-  fail "duplicate exact-name IDs conflict instead of contributing union coverage"
+  fail "duplicate STARTED IDs are independently verified without unioning coverage"
+fi
+
+write_json "$TEST_TMP/candidates-started-terminal.json" '[
+  {"id":"BLACKOUT-A","name":"MF_2_CDBA_Migration","status":"STARTED","type":"PATCHING","owner":"mf"},
+  {"id":"BLACKOUT-T","name":"MF_2_CDBA_Migration","status":"STOPPED","type":"PATCHING","owner":"mf"}
+]'
+write_json "$TEST_TMP/detail-blackout-terminal.json" \
+  '{"id":"BLACKOUT-T","name":"MF_2_CDBA_Migration","status":"STOPPED"}'
+if (
+  mf_oem_get_blackout() {
+    case "$1" in
+      BLACKOUT-A) cp "$TEST_TMP/detail-blackout-a.json" "$2" ;;
+      BLACKOUT-T) cp "$TEST_TMP/detail-blackout-terminal.json" "$2" ;;
+      *) return 1 ;;
+    esac
+  }
+  mf_oem_fetch_blackout_targets() { cp "$TEST_TMP/actual-full.json" "$2"; }
+  mf_oem_inspect_exact_blackouts "$TEST_TMP/candidates-started-terminal.json" "$TEST_TMP/expected.json" \
+    "$TEST_TMP/inspection-started-terminal.json"
+) && jq -e '.candidateCount == 2 and .terminalCandidateCount == 1 and .exactStartedCandidateCount == 1 and .transitionalCandidateCount == 0' \
+      "$TEST_TMP/inspection-started-terminal.json" >/dev/null
+then
+  pass "STOPPED duplicate is a historical record beside a verified STARTED blackout"
+else
+  fail "STOPPED duplicate is a historical record beside a verified STARTED blackout"
 fi
 
 write_json "$TEST_TMP/candidate-one.json" '[
   {"id":"BLACKOUT-1","name":"MF_2_CDBA_Migration","status":"STARTED","type":"PATCHING","owner":"mf"}
 ]'
 write_json "$TEST_TMP/detail-started.json" \
-  '{"id":"BLACKOUT-1","name":"MF_2_CDBA_Migration","status":"STARTED"}'
+  '{"id":"BLACKOUT-1","name":"MF_2_CDBA_Migration","status":"STARTED","creationTimeToEnd":"2026-08-10T14:00+02:00"}'
 write_json "$TEST_TMP/detail-scheduled.json" \
   '{"id":"BLACKOUT-1","name":"MF_2_CDBA_Migration","status":"SCHEDULED"}'
-write_json "$TEST_TMP/actual-full.json" '[
-  {"id":"db-1","name":"renamed-display-value","typeName":"oracle_database"},
-  {"id":"pdb-1","name":"another-display-value","typeName":"oracle_pdb"}
-]'
 write_json "$TEST_TMP/actual-incomplete.json" '[
   {"id":"db-1","name":"exa1_CDBA_M1","typeName":"oracle_database"}
 ]'
@@ -284,14 +353,13 @@ else
 fi
 
 if mf_oem_print_inspection "$TEST_TMP/inspection-one.json" > "$TEST_TMP/inspection-output.txt" \
-   && grep -F 'oracle_database       : 1 discovered' "$TEST_TMP/inspection-output.txt" >/dev/null \
-   && grep -F 'oracle_pdb (optional) : 1 discovered; every discovered PDB is required' \
-        "$TEST_TMP/inspection-output.txt" >/dev/null \
-   && grep -F 'Discovered target IDs: COMPLETE' "$TEST_TMP/inspection-output.txt" >/dev/null
+   && grep -F 'all 2 discovered targets are covered by the blackout' "$TEST_TMP/inspection-output.txt" >/dev/null \
+   && grep -F 'Blackout status       : STARTED' "$TEST_TMP/inspection-output.txt" >/dev/null \
+   && grep -F 'Blackout will end at (UTC): 2026-08-10T12:00Z' "$TEST_TMP/inspection-output.txt" >/dev/null
 then
-  pass "inspection output formats target counts without jq quoting errors"
+  pass "inspection output reports complete coverage, status, and OEM end time"
 else
-  fail "inspection output formats target counts without jq quoting errors"
+  fail "inspection output reports complete coverage, status, and OEM end time"
 fi
 
 if (
@@ -305,6 +373,14 @@ then
   pass "singleton exact-name blackout is incomplete when any discovered PDB ID is missing"
 else
   fail "singleton exact-name blackout is incomplete when any discovered PDB ID is missing"
+fi
+if mf_oem_print_inspection "$TEST_TMP/inspection-incomplete.json" > "$TEST_TMP/inspection-incomplete.out" \
+   && grep -F '2 discovered targets; 1 targets covered by the canonical blackout' "$TEST_TMP/inspection-incomplete.out" >/dev/null \
+   && grep -F 'coverage is incomplete; use START to reconcile the canonical blackout' "$TEST_TMP/inspection-incomplete.out" >/dev/null
+then
+  pass "STATUS directs incomplete canonical coverage to START reconciliation"
+else
+  fail "STATUS directs incomplete canonical coverage to START reconciliation"
 fi
 
 write_json "$TEST_TMP/candidate-stopped.json" '[
@@ -327,12 +403,14 @@ else
   fail "terminal canonical blackout is rediscovered by verified ID without requiring its targets endpoint"
 fi
 if mf_oem_print_inspection "$TEST_TMP/inspection-terminal.json" > "$TEST_TMP/terminal-inspection-output.txt" \
-   && grep -F 'Discovered target IDs: NOT CHECKED (terminal cleanup)' \
-        "$TEST_TMP/terminal-inspection-output.txt" >/dev/null
+   && grep -F 'no active canonical blackout; the STOPPED record is historical' \
+         "$TEST_TMP/terminal-inspection-output.txt" >/dev/null \
+   && grep -F 'use START to create a new blackout' \
+         "$TEST_TMP/terminal-inspection-output.txt" >/dev/null
 then
-  pass "terminal cleanup does not misleadingly report discovered target coverage as incomplete"
+  pass "terminal records report as historical and do not require cleanup"
 else
-  fail "terminal cleanup does not misleadingly report discovered target coverage as incomplete"
+  fail "terminal records report as historical and do not require cleanup"
 fi
 
 # -----------------------------------------------------------------------------
@@ -364,6 +442,9 @@ write_json "$TEST_TMP/inspection-incomplete-start.json" '{
   "candidateCount":1,"activeCandidateCount":1,"blackoutId":"BLACKOUT-1",
   "status":"STARTED","exactTargetIds":false,"expectedTargets":[]
 }'
+write_json "$TEST_TMP/edit-response.json" \
+  '{"id":"BLACKOUT-1","name":"MF_2_CDBA_Migration","status":"STARTED"}'
+: > "$TEST_TMP/reconcile-sequence.log"
 if (
   mf_oem_validate_config() { :; }
   mf_oem_prepare_inspection() {
@@ -371,15 +452,53 @@ if (
     cp "$TEST_TMP/inspection-incomplete-start.json" "$7"
   }
   mf_oem_print_inspection() { :; }
-  mf_oem_http() { return 99; }
-  mf_oem_start_blackout MIG-42 42 CDBA CDBA_M1 12:00 >/dev/null 2>&1
-  rc=$?
-  [ "$rc" -eq 3 ] && [ "$MF_OEM_START_MUTATION_ATTEMPTED" = N ]
+  mf_oem_get_blackout() { cp "$TEST_TMP/detail-started.json" "$2"; }
+  mf_oem_verify_blackout_targets() {
+    [ "$1" = BLACKOUT-1 ] && printf 'VERIFY %s\n' "$1" >> "$TEST_TMP/reconcile-sequence.log"
+  }
+  mf_oem_http() {
+    [ "$1" = PATCH ] \
+      && [ "$2" = "https://oms.example:7803/em/api/blackouts/BLACKOUT-1" ] \
+      || return 1
+    jq -e '.targets == [{"id":"db-1"},{"id":"pdb-1"}]' "$4" >/dev/null || return 1
+    printf 'PATCH %s\n' "$2" >> "$TEST_TMP/reconcile-sequence.log"
+    cp "$TEST_TMP/edit-response.json" "$3"
+    MF_OEM_HTTP_STATUS=200
+  }
+  mf_oem_start_blackout MIG-42 42 CDBA CDBA_M1 12:00 >/dev/null \
+    && [ "$MF_OEM_START_MUTATION_ATTEMPTED" = Y ] \
+    && [ "$MF_OEM_DELETE_MUTATION_ATTEMPTED" = N ] \
+    && [ "$(sed -n '1p' "$TEST_TMP/reconcile-sequence.log")" = \
+         "PATCH https://oms.example:7803/em/api/blackouts/BLACKOUT-1" ] \
+    && [ "$(sed -n '2p' "$TEST_TMP/reconcile-sequence.log")" = "VERIFY BLACKOUT-1" ] \
+    && [ "$(wc -l < "$TEST_TMP/reconcile-sequence.log" | tr -d ' ')" -eq 2 ]
 )
 then
-  pass "START fails semantically for an incomplete exact-name candidate and does not create"
+  pass "START patches one incomplete active canonical ID and verifies complete target coverage"
 else
-  fail "START fails semantically for an incomplete exact-name candidate and does not create"
+  fail "START patches one incomplete active canonical ID and verifies complete target coverage"
+fi
+
+if (
+  mf_oem_validate_config() { :; }
+  mf_oem_prepare_inspection() {
+    : > "$4"; cp "$TEST_TMP/expected.json" "$5"; cp "$TEST_TMP/candidate-one.json" "$6"
+    cp "$TEST_TMP/inspection-incomplete-start.json" "$7"
+  }
+  mf_oem_print_inspection() { :; }
+  mf_oem_get_blackout() { cp "$TEST_TMP/detail-started.json" "$2"; }
+  mf_oem_http() { return 1; }
+  mf_oem_start_blackout MIG-42 42 CDBA CDBA_M1 12:00 >/dev/null 2>&1
+  rc=$?
+  [ "$rc" -ne 0 ] \
+    && [ "$MF_OEM_START_MUTATION_ATTEMPTED" = Y ] \
+    && [ "$MF_OEM_DELETE_MUTATION_ATTEMPTED" = N ] \
+    && [ "$MF_OEM_MUTATION_ATTEMPTED" = Y ]
+)
+then
+  pass "uncertain target PATCH is mutation-guarded and never falls through to delete or create"
+else
+  fail "uncertain target PATCH is mutation-guarded and never falls through to delete or create"
 fi
 
 write_json "$TEST_TMP/inspection-create.json" '{
@@ -422,15 +541,8 @@ if (
   }
   mf_oem_print_inspection() { :; }
   mf_oem_verify_blackout_targets() { [ "$1" = BLACKOUT-NEW ]; }
-  mf_oem_wait_for_blackout_absent() {
-    [ "$1" = BLACKOUT-OLD ] || return 1
-    printf 'CONFIRM_ABSENT %s\n' "$1" >> "$TEST_TMP/reuse-sequence.log"
-  }
   mf_oem_http() {
     case "$1 $2" in
-      "DELETE https://oms.example:7803/em/api/blackouts/BLACKOUT-OLD")
-        printf 'DELETE_OLD %s\n' "$2" >> "$TEST_TMP/reuse-sequence.log"
-        : > "$3"; MF_OEM_HTTP_STATUS=204 ;;
       "POST https://oms.example:7803/em/api/blackouts")
         printf 'POST_CREATE %s\n' "$2" >> "$TEST_TMP/reuse-sequence.log"
         cp "$TEST_TMP/create-response.json" "$3"; MF_OEM_HTTP_STATUS=201 ;;
@@ -438,24 +550,21 @@ if (
     esac
   }
   mf_oem_start_blackout MIG-42 42 CDBA CDBA_M1 12:00 >/dev/null 2>&1 \
-    && [ "$MF_OEM_DELETE_MUTATION_ATTEMPTED" = Y ] \
+    && [ "$MF_OEM_DELETE_MUTATION_ATTEMPTED" = N ] \
     && [ "$MF_OEM_START_MUTATION_ATTEMPTED" = Y ] \
     && [ "$(sed -n '1p' "$TEST_TMP/reuse-sequence.log")" = \
-         "DELETE_OLD https://oms.example:7803/em/api/blackouts/BLACKOUT-OLD" ] \
-    && [ "$(sed -n '2p' "$TEST_TMP/reuse-sequence.log")" = \
-         "CONFIRM_ABSENT BLACKOUT-OLD" ] \
-    && [ "$(sed -n '3p' "$TEST_TMP/reuse-sequence.log")" = \
-         "POST_CREATE https://oms.example:7803/em/api/blackouts" ]
+         "POST_CREATE https://oms.example:7803/em/api/blackouts" ] \
+    && [ "$(wc -l < "$TEST_TMP/reuse-sequence.log" | tr -d ' ')" -eq 1 ]
 )
 then
-  pass "START deletes one terminal canonical ID, confirms absence, then recreates the same name"
+  pass "START treats one terminal canonical ID as historical and creates the same name without DELETE"
 else
-  fail "START deletes one terminal canonical ID, confirms absence, then recreates the same name"
+  fail "START treats one terminal canonical ID as historical and creates the same name without DELETE"
 fi
 
 write_json "$TEST_TMP/inspection-stop-pending.json" '{
   "candidateCount":1,"activeCandidateCount":1,"blackoutId":"BLACKOUT-OLD",
-  "status":"STOP_PENDING","exactTargetIds":true,"expectedTargets":[]
+  "status":"STOP_PENDING","exactTargetIds":false,"expectedTargets":[]
 }'
 write_json "$TEST_TMP/detail-stop-pending.json" \
   '{"id":"BLACKOUT-OLD","name":"MF_2_CDBA_Migration","status":"STOP_PENDING"}'
@@ -495,9 +604,9 @@ if (
          "POST_CREATE https://oms.example:7803/em/api/blackouts" ]
 )
 then
-  pass "START waits for STOP_PENDING to become terminal before delete, absence confirmation, and recreate"
+  pass "START recreates incomplete STOP_PENDING coverage only after terminal state and absence confirmation"
 else
-  fail "START waits for STOP_PENDING to become terminal before delete, absence confirmation, and recreate"
+  fail "START recreates incomplete STOP_PENDING coverage only after terminal state and absence confirmation"
 fi
 
 if (
@@ -693,7 +802,8 @@ if (
   mf_oem_http() { return 99; }
   mf_oem_stop_blackout MIG-42 42 CDBA CDBA_M1 >"$TEST_TMP/terminal-stop.out" 2>&1 \
     && [ "$MF_OEM_DELETE_MUTATION_ATTEMPTED" = N ] \
-    && grep -F 'START will clean up the terminal definition' "$TEST_TMP/terminal-stop.out" >/dev/null
+    && grep -F 'Blackout has been STOPPED' "$TEST_TMP/terminal-stop.out" >/dev/null \
+    && grep -F 'Terminal cleanup is deferred to a later START' "$TEST_TMP/terminal-stop.out" >/dev/null
 )
 then
   pass "repeated STOP treats a terminal blackout as complete and leaves cleanup to START"
@@ -712,7 +822,7 @@ if (
   mf_oem_stop_blackout MIG-42 42 CDBA CDBA_M1 >"$TEST_TMP/pending-stop.out" 2>&1 \
     && [ "$MF_OEM_STOP_MUTATION_ATTEMPTED" = N ] \
     && [ "$MF_OEM_DELETE_MUTATION_ATTEMPTED" = N ] \
-    && grep -F 'already STOP_PENDING; STOP remains non-blocking' "$TEST_TMP/pending-stop.out" >/dev/null
+    && grep -F 'Blackout has been STOP_PENDING; STOP remains non-blocking' "$TEST_TMP/pending-stop.out" >/dev/null
 )
 then
   pass "repeated STOP on STOP_PENDING is a non-blocking no-op"
@@ -744,15 +854,27 @@ if (
     cp "$TEST_TMP/inspection-duplicate.json" "$7"
   }
   mf_oem_print_inspection() { :; }
-  mf_oem_http() { return 99; }
-  mf_oem_stop_blackout MIG-42 42 CDBA CDBA_M1 >/dev/null 2>&1
-  rc=$?
-  [ "$rc" -eq 3 ] && [ "$MF_OEM_MUTATION_ATTEMPTED" = N ]
+  mf_oem_get_blackout() {
+    case "$1" in
+      BLACKOUT-A) cp "$TEST_TMP/detail-blackout-a.json" "$2" ;;
+      BLACKOUT-B) cp "$TEST_TMP/detail-blackout-b.json" "$2" ;;
+      *) return 1 ;;
+    esac
+  }
+  mf_oem_fetch_blackout_targets() { cp "$TEST_TMP/actual-full.json" "$2"; }
+  mf_oem_http() {
+    case "$2" in
+      *BLACKOUT-A/actions/stop|*BLACKOUT-B/actions/stop) : > "$3"; MF_OEM_HTTP_STATUS=204 ;;
+      *) return 1 ;;
+    esac
+  }
+  mf_oem_stop_blackout MIG-42 42 CDBA CDBA_M1 >/dev/null \
+    && [ "$MF_OEM_MUTATION_ATTEMPTED" = Y ]
 )
 then
-  pass "STOP rejects duplicate exact-name IDs without mutating any of them"
+  pass "STOP requests a stop for every verified duplicate STARTED ID"
 else
-  fail "STOP rejects duplicate exact-name IDs without mutating any of them"
+  fail "STOP requests a stop for every verified duplicate STARTED ID"
 fi
 
 # -----------------------------------------------------------------------------
@@ -782,12 +904,12 @@ fi
 mf_oem_cleanup
 
 if ! grep -Eq 'coveredTargets|fullCoverageBlackoutIds|stoppableFullCoverageBlackoutIds|mf_oem_append_json_array|mf_oem_build_blackout_coverage' "$HELPER" \
-   && ! grep -Eq 'MF_OEM_BLACKOUT_STATE|mf_oem_(prepare|write)_state|timeToEnd|MLS_ID_GOLIVE_START|MF_OEM_LOOKUP_RESULT' "$HELPER" "$MAIN_SCRIPT" \
+   && ! grep -Eq 'MF_OEM_BLACKOUT_STATE|mf_oem_(prepare|write)_state|MF_OEM_LOOKUP_RESULT' "$HELPER" \
    && ! grep -F 'MF_${migration_id}' "$HELPER" >/dev/null
 then
-  pass "union coverage, obsolete persistence, scheduling policy, lookup globals, and non-canonical helper fallback are removed"
+  pass "union coverage, obsolete persistence, lookup globals, and non-canonical helper fallback are removed"
 else
-  fail "union coverage, obsolete persistence, scheduling policy, lookup globals, and non-canonical helper fallback are removed"
+  fail "union coverage, obsolete persistence, lookup globals, and non-canonical helper fallback are removed"
 fi
 
 if grep -F 'MF_OEM_MUTATION_ATTEMPTED:-N' "$MAIN_SCRIPT" >/dev/null \
@@ -796,14 +918,14 @@ if grep -F 'MF_OEM_MUTATION_ATTEMPTED:-N' "$MAIN_SCRIPT" >/dev/null \
    && grep -F 'MF_OEM_DELETE_MUTATION_ATTEMPTED=Y' "$HELPER" >/dev/null \
    && grep -F 'Migration Factory will continue without emctl fallback' "$MAIN_SCRIPT" >/dev/null \
    && grep -F 'MF_OEM_STOP_PENDING_TIMEOUT=${MF_OEM_STOP_PENDING_TIMEOUT:-300}' "$HELPER" >/dev/null \
-   && grep -F 'terminal cleanup is deferred to a later START' "$HELPER" >/dev/null \
+   && grep -F 'Terminal cleanup is deferred to a later START' "$HELPER" >/dev/null \
+   && grep -F 'mf_oem_http PATCH' "$HELPER" >/dev/null \
    && ! grep -F 'mf_oem_wait_for_stopped' "$HELPER" >/dev/null \
-   && ! grep -F 'mf_oem_http PATCH' "$HELPER" >/dev/null \
    && ! grep -F 'die "Centralized OEM REST stop' "$MAIN_SCRIPT" >/dev/null
 then
-  pass "START owns bounded terminal cleanup while STOP remains non-blocking and mutation-guarded"
+  pass "START owns target PATCH and bounded terminal cleanup while STOP remains non-blocking and mutation-guarded"
 else
-  fail "START owns bounded terminal cleanup while STOP remains non-blocking and mutation-guarded"
+  fail "START owns target PATCH and bounded terminal cleanup while STOP remains non-blocking and mutation-guarded"
 fi
 
 if grep -F 'select prj_name, peer_tclu_id' "$HELPER" >/dev/null \
@@ -816,14 +938,33 @@ else
 fi
 
 if grep -F 'while getopts :m:A:d:rQVnh opt' "$MAIN_SCRIPT" >/dev/null \
+   && grep -F 'USE_REST_API=N' "$MAIN_SCRIPT" >/dev/null \
+   && grep -F 'DURATION_EXPLICIT=N' "$MAIN_SCRIPT" >/dev/null \
+   && grep -F "interval '2' hour" "$MAIN_SCRIPT" >/dev/null \
+   && grep -F "'MLS_ID_GOLIVE_START'" "$MAIN_SCRIPT" >/dev/null \
    && grep -F 'MF_OEM_BLACKOUT_NAME=MF_2_${cdb_name}_Migration' "$HELPER" >/dev/null \
    && grep -F 'start blackout MF_2_${CDB_NAME}_Migration \$(echo \"$targets\") -d $DURATION' "$MAIN_SCRIPT" >/dev/null \
    && grep -F 'grep MF_2.*${CDB_NAME}_Migration' "$MAIN_SCRIPT" >/dev/null
 then
-  pass "-r is opt-in and the original local emctl name, duration, and IS_ON commands remain"
+  pass "-r is opt-in; REST START defaults to planned GO-LIVE + 2h while local emctl stays compatible"
 else
-  fail "-r is opt-in and the original local emctl name, duration, and IS_ON commands remain"
+  fail "-r is opt-in; REST START defaults to planned GO-LIVE + 2h while local emctl stays compatible"
 fi
+
+constants_sources=(
+  "$RELEASE_ROOT/bin/mfUtils_99_constants.sh.example"
+  "$RELEASE_ROOT/unstable_bin/mfUtils_99_constants.sh.example"
+)
+for constants_source in "${constants_sources[@]}"
+do
+  if grep -F 'MF_OEM_API_BASE_URL' "$constants_source" >/dev/null \
+     && grep -F 'WEB_USER|OEM_REST_API' "$constants_source" >/dev/null
+  then
+    pass "REST configuration is available from $(basename "$(dirname "$constants_source")")"
+  else
+    fail "REST configuration is available from $(basename "$(dirname "$constants_source")")"
+  fi
+done
 
 apex_sources=(
   "$RELEASE_ROOT/repository/plsql/mf_apex_utils.pkb"
@@ -832,13 +973,14 @@ apex_sources=(
 )
 for apex_source in "${apex_sources[@]}"
 do
-  if grep -F "rec.code || ' -A START ,Start local emctl Blackout'" "$apex_source" >/dev/null \
-     && grep -F "rec.code || ' -r -A START ,Start OEM REST Blackout for 12 hours'" "$apex_source" >/dev/null \
-     && ! grep -Ei 'go-live plus|GL\+12h|state.file' "$apex_source" >/dev/null
+  if ! grep -F "Start local emctl Blackout" "$apex_source" >/dev/null \
+     && grep -F "rec.code || ' -r -A START ,Start OEM REST Blackout until planned GO-LIVE plus 2 hours'" "$apex_source" >/dev/null \
+     && grep -F 'Start (GO-LIVE + 2h)</A>' "$apex_source" >/dev/null \
+     && ! grep -Ei 'GL\+12h|state.file' "$apex_source" >/dev/null
   then
-    pass "APEX keeps separate local/REST actions with duration wording ($(basename "$apex_source"))"
+    pass "APEX exposes only the opt-in REST actions with GO-LIVE + 2h wording ($(basename "$apex_source"))"
   else
-    fail "APEX keeps separate local/REST actions with duration wording ($(basename "$apex_source"))"
+    fail "APEX exposes only the opt-in REST actions with GO-LIVE + 2h wording ($(basename "$apex_source"))"
   fi
 done
 

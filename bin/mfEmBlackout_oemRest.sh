@@ -15,6 +15,24 @@
 #               and blackout IDs are validated before use in request paths.
 # -----------------------------------------------------------------------------
 
+MF_OEM_REST_VERSION=1.16
+# -----------------------------------------------------------------------------
+# Modifications:
+# ==============
+#
+# 06/08/2026 AIN - Version 1.9, add opt-in centralized OEM REST blackout
+#                  support for Migration Factory.
+# 07/08/2026 AIN - Versions 1.10-1.12, add REST lifecycle actions, preserve
+#                  local emctl compatibility, and harden REST fallback rules.
+# 08/08/2026 AIN - Versions 1.13-1.14, use one canonical blackout identity,
+#                  verify target-ID coverage, and handle STOP_PENDING safely.
+# 10/08/2026 AIN - Version 1.15, derive REST START duration from the planned
+#                  GO-LIVE window when no explicit duration is supplied.
+# 15/09/2026 AIN - Version 1.16, classify STOPPED and ENDED same-name records
+#                  as historical, reuse verified duplicate STARTED records,
+#                  and stop every verified exact-coverage STARTED duplicate.
+# -----------------------------------------------------------------------------
+
 declare -a MF_OEM_TMP_FILES=()
 
 mf_oem_error()
@@ -422,78 +440,91 @@ mf_oem_inspect_exact_blackouts()
   local expected_file="$2"
   local output_file="$3"
   local candidate_count blackout_id blackout_name current_status
-  local detail_file actual_file ids_match=false active=false terminal=false
+  local detail_file actual_file entry_file append_file inspected_file
+  local ids_match terminal
 
   blackout_name=$(mf_oem_blackout_name) || return 1
   candidate_count=$(jq 'length' "$candidates_file") || return 1
-  if [ "$candidate_count" -ne 1 ]
-  then
-    jq -n --slurpfile candidates "$candidates_file" --slurpfile expected "$expected_file" '
+  mf_oem_new_temp_file inspected_file || return 1
+  printf '[]\n' > "$inspected_file" || return 1
+
+  for blackout_id in $(jq -r '.[].id' "$candidates_file")
+  do
+    [[ "$blackout_id" =~ ^[A-Za-z0-9._-]+$ ]] \
+      || mf_oem_error "OEM returned an unsafe blackout ID" || return 1
+    mf_oem_new_temp_file detail_file || return 1
+    mf_oem_get_blackout "$blackout_id" "$detail_file" || return 1
+    jq -e --arg id "$blackout_id" --arg name "$blackout_name" \
+      '.id == $id and .name == $name' "$detail_file" >/dev/null \
+      || mf_oem_error "OEM blackout identity changed during verification" || return 1
+    current_status=$(jq -r '.status' "$detail_file") || return 1
+
+    terminal=false
+    ids_match=false
+    mf_oem_new_temp_file actual_file || return 1
+    case "$current_status" in
+      STOPPED|ENDED)
+        # Terminal records have no live coverage. They are logical tombstones,
+        # even when an operator has not physically deleted them from OEM.
+        terminal=true
+        printf '[]\n' > "$actual_file" || return 1
+        ;;
+      *)
+        mf_oem_fetch_blackout_targets "$blackout_id" "$actual_file" || return 1
+        mf_oem_target_ids_equal "$expected_file" "$actual_file" && ids_match=true
+        ;;
+    esac
+
+    mf_oem_new_temp_file entry_file || return 1
+    jq -n \
+      --argjson terminal "$terminal" \
+      --argjson idsMatch "$ids_match" \
+      --slurpfile detail "$detail_file" \
+      --slurpfile actual "$actual_file" '
+      $detail[0] as $detail |
       {
-        candidateCount: ($candidates[0] | length),
-        activeCandidateCount: ([ $candidates[0][] | select(.status as $status | [
+        id: $detail.id,
+        name: $detail.name,
+        status: $detail.status,
+        owner: ($detail.owner // null),
+        endTime: ($detail.creationTimeToEnd // $detail.timeToEnd // null),
+        terminal: $terminal,
+        exactTargetIds: $idsMatch,
+        actualTargets: $actual[0]
+      }
+    ' > "$entry_file" || mf_oem_error "Unable to inspect OEM blackout candidate" || return 1
+    mf_oem_new_temp_file append_file || return 1
+    jq --slurpfile entry "$entry_file" '. + $entry' "$inspected_file" > "$append_file" \
+      || mf_oem_error "Unable to collect OEM blackout candidate inspection" || return 1
+    mv -f -- "$append_file" "$inspected_file" || return 1
+  done
+
+  jq -n \
+    --slurpfile candidates "$candidates_file" \
+    --slurpfile inspected "$inspected_file" \
+    --slurpfile expected "$expected_file" \
+    '
+      $inspected[0] as $items |
+      {
+        candidateCount: ($items | length),
+        activeCandidateCount: ([ $items[] | select(.status as $status | [
           "SCHEDULED", "START_PROCESSING", "START_PARTIAL", "STARTED",
           "STOP_PENDING", "STOP_FAILED", "STOP_PARTIAL",
           "EDIT_PENDING", "EDIT_FAILED", "EDIT_PARTIAL", "END_PARTIAL"
         ] | index($status) != null) ] | length),
+        terminalCandidateCount: ([ $items[] | select(.terminal) ] | length),
+        startedCandidateCount: ([ $items[] | select(.status == "STARTED") ] | length),
+        exactStartedCandidateCount: ([ $items[] | select(.status == "STARTED" and .exactTargetIds) ] | length),
+        transitionalCandidateCount: ([ $items[] | select(.terminal | not) | select(.status != "STARTED") ] | length),
         candidates: $candidates[0],
+        inspectedCandidates: $items,
+        blackoutId: (if ($items | length) == 1 then $items[0].id else null end),
+        status: (if ($items | length) == 1 then $items[0].status else null end),
+        endTime: (if ($items | length) == 1 then $items[0].endTime else null end),
+        terminal: (if ($items | length) == 1 then $items[0].terminal else false end),
         expectedTargets: $expected[0],
-        actualTargets: [],
-        exactTargetIds: false
-      }
-    ' > "$output_file" || mf_oem_error "Unable to describe OEM blackout candidates"
-    return
-  fi
-
-  blackout_id=$(jq -er '.[0].id' "$candidates_file") || return 1
-  [[ "$blackout_id" =~ ^[A-Za-z0-9._-]+$ ]] \
-    || mf_oem_error "OEM returned an unsafe blackout ID" || return 1
-  mf_oem_new_temp_file detail_file || return 1
-  mf_oem_get_blackout "$blackout_id" "$detail_file" || return 1
-  jq -e --arg id "$blackout_id" --arg name "$blackout_name" \
-    '.id == $id and .name == $name' "$detail_file" >/dev/null \
-    || mf_oem_error "OEM blackout identity changed during verification" || return 1
-  current_status=$(jq -r '.status' "$detail_file") || return 1
-
-  mf_oem_new_temp_file actual_file || return 1
-  case "$current_status" in
-    STOPPED|ENDED)
-      # A terminal exact-name resource is safe to clean up by its verified ID.
-      # Its targets endpoint is not required to remain available after STOP.
-      terminal=true
-      printf '[]\n' > "$actual_file" || return 1
-      ;;
-    *)
-      mf_oem_fetch_blackout_targets "$blackout_id" "$actual_file" || return 1
-      mf_oem_target_ids_equal "$expected_file" "$actual_file" && ids_match=true
-      ;;
-  esac
-  jq -e '.status as $status | [
-      "SCHEDULED", "START_PROCESSING", "START_PARTIAL", "STARTED",
-      "STOP_PENDING", "STOP_FAILED", "STOP_PARTIAL",
-      "EDIT_PENDING", "EDIT_FAILED", "EDIT_PARTIAL", "END_PARTIAL"
-    ] | index($status) != null' "$detail_file" >/dev/null && active=true
-
-  jq -n \
-    --argjson active "$active" \
-    --argjson terminal "$terminal" \
-    --argjson idsMatch "$ids_match" \
-    --slurpfile candidates "$candidates_file" \
-    --slurpfile detail "$detail_file" \
-    --slurpfile expected "$expected_file" \
-    --slurpfile actual "$actual_file" '
-      {
-        candidateCount: 1,
-        activeCandidateCount: (if $active then 1 else 0 end),
-        candidates: $candidates[0],
-        blackoutId: $detail[0].id,
-        status: $detail[0].status,
-        endTime: ($detail[0].creationTimeToEnd // $detail[0].timeToEnd // null),
-        active: $active,
-        terminal: $terminal,
-        expectedTargets: $expected[0],
-        actualTargets: $actual[0],
-        exactTargetIds: $idsMatch
+        actualTargets: (if ($items | length) == 1 then $items[0].actualTargets else [] end),
+        exactTargetIds: (if ($items | length) == 1 then $items[0].exactTargetIds else false end)
       }
     ' > "$output_file" || mf_oem_error "Unable to build the canonical OEM blackout inspection"
 }
@@ -513,11 +544,21 @@ mf_oem_print_inspection()
      then "Blackout situation    : \($discovered) discovered targets; 0 targets covered by the canonical blackout.",
           "Action required       : no canonical blackout exists; use START to create one."
      elif $inspection.candidateCount > 1
-     then "Blackout situation    : ambiguous; multiple canonical blackouts were found.",
-          "Action required       : resolve the duplicate blackouts before using START."
+     then "WARNING: Found \($inspection.candidateCount) OEM blackouts named \($inspection.candidates[0].name).",
+          ($inspection.inspectedCandidates[] |
+            "WARNING: Candidate \(.id) is \(.status); exact target coverage=\(.exactTargetIds)."),
+          (if $inspection.terminalCandidateCount > 0
+           then "WARNING: \($inspection.terminalCandidateCount) STOPPED or ENDED candidate(s) are treated as historical records."
+           else empty end),
+          (if $inspection.transitionalCandidateCount > 0
+           then "Action required       : a same-name blackout is in a transitional or unsupported state."
+           elif $inspection.exactStartedCandidateCount > 0
+           then "Blackout situation    : \($inspection.exactStartedCandidateCount) STARTED candidate(s) have exact target coverage."
+           else "Action required       : no STARTED same-name blackout has exact target coverage."
+           end)
      elif $inspection.terminal
-     then "Blackout situation    : terminal blackout found with status \($inspection.status).",
-          "Action required       : use START to clean up the terminal blackout and create a new one."
+     then "Blackout situation    : no active canonical blackout; the \($inspection.status) record is historical.",
+          "Action required       : use START to create a new blackout."
      elif $inspection.exactTargetIds
      then "Blackout situation    : all \($discovered) discovered targets are covered by the blackout.",
           "Blackout status       : \($inspection.status)",
@@ -1023,6 +1064,23 @@ mf_oem_print_existing_start_result()
   printf '         Blackout will end at (UTC): %s\n' "$end_time"
 }
 
+mf_oem_print_reused_started_blackouts()
+{
+  local inspection_file="$1"
+
+  jq -r '
+    if .candidateCount > 1 then
+      "WARNING: Found \(.candidateCount) OEM blackouts named \(.candidates[0].name)."
+    else empty end,
+    (.inspectedCandidates[] |
+      select(.status == "STARTED" and .exactTargetIds) |
+      "         Using STARTED blackout \(.id) with exact target coverage; it ends at \(.endTime // "not returned by OEM")."),
+    (if .terminalCandidateCount > 0
+     then "WARNING: \(.terminalCandidateCount) STOPPED or ENDED same-name blackout(s) are treated as historical records."
+     else empty end)
+  ' "$inspection_file" || mf_oem_error "Unable to report reusable OEM blackouts"
+}
+
 mf_oem_prepare_inspection()
 {
   local repository_migration_id="$1"
@@ -1050,8 +1108,8 @@ mf_oem_start_blackout()
   local cdb_name="$3"
   local target_container_service="$4"
   local duration="$5"
-  local topology_file targets_file candidates_file inspection_file payload_file response_file transition_file
-  local candidate_count blackout_id status recovery_rc cleanup_terminal=N
+  local topology_file targets_file candidates_file inspection_file payload_file response_file
+  local candidate_count blackout_id status
 
   umask 077
   MF_OEM_BLACKOUT_NAME=MF_2_${cdb_name}_Migration
@@ -1080,10 +1138,7 @@ mf_oem_start_blackout()
     status=$(jq -r '.status' "$inspection_file") || return 1
     case "$status" in
       SCHEDULED|STARTED)
-        if jq -e '
-         .activeCandidateCount == 1 and
-         .exactTargetIds
-        ' "$inspection_file" >/dev/null
+        if jq -e '.activeCandidateCount == 1 and .exactTargetIds' "$inspection_file" >/dev/null
         then
           mf_oem_print_existing_start_result "$inspection_file" || return 1
           return 0
@@ -1094,23 +1149,12 @@ mf_oem_start_blackout()
         return $?
         ;;
       STOP_PENDING)
-        if ! jq -e '.activeCandidateCount == 1' "$inspection_file" >/dev/null
-        then
-          mf_oem_error "The STOP_PENDING canonical OEM blackout is not uniquely active"
-          return 3
-        fi
-        blackout_id=$(jq -r '.blackoutId' "$inspection_file") || return 1
-        mf_oem_new_temp_file transition_file || return 1
-        mf_oem_warning "Blackout $blackout_id is STOP_PENDING; START will wait up to $MF_OEM_STOP_PENDING_TIMEOUT seconds for a safe terminal state before recreating complete target coverage."
-        mf_oem_wait_for_restart_terminal "$blackout_id" "$transition_file"
-        recovery_rc=$?
-        [ "$recovery_rc" -eq 0 ] || return "$recovery_rc"
-        status=$(jq -r '.status' "$transition_file") || return 1
-        cleanup_terminal=Y
+        mf_oem_new_temp_file response_file || return 1
+        mf_oem_warning "Blackout $(jq -r '.blackoutId' "$inspection_file") is STOP_PENDING; START will wait up to $MF_OEM_STOP_PENDING_TIMEOUT seconds for a terminal state before creating a new blackout."
+        mf_oem_wait_for_restart_terminal "$(jq -r '.blackoutId' "$inspection_file")" "$response_file" || return $?
         ;;
       STOPPED|ENDED)
-        blackout_id=$(jq -r '.blackoutId' "$inspection_file") || return 1
-        cleanup_terminal=Y
+        mf_oem_warning "Terminal blackout $(jq -r '.blackoutId' "$inspection_file") [$status] is treated as a historical record."
         ;;
       *)
         mf_oem_error "The exact canonical OEM blackout is in unsupported START state $status"
@@ -1119,16 +1163,21 @@ mf_oem_start_blackout()
     esac
   elif [ "$candidate_count" -gt 1 ]
   then
-    mf_oem_error "More than one exact canonical OEM blackout exists"
-    return 3
-  fi
-
-  if [ "$cleanup_terminal" = Y ]
-  then
-    mf_oem_warning "Removing terminal blackout $blackout_id [$status] before START."
-    mf_oem_delete_blackout "$blackout_id" || return 1
-    mf_oem_wait_for_blackout_absent "$blackout_id" || return $?
-    candidate_count=0
+    if ! jq -e '.transitionalCandidateCount == 0' "$inspection_file" >/dev/null
+    then
+      mf_oem_error "START found a same-name OEM blackout in a transitional or unsupported state"
+      return 3
+    fi
+    if jq -e '.exactStartedCandidateCount > 0' "$inspection_file" >/dev/null
+    then
+      mf_oem_print_reused_started_blackouts "$inspection_file" || return 1
+      return 0
+    fi
+    if jq -e '.startedCandidateCount > 0' "$inspection_file" >/dev/null
+    then
+      mf_oem_error "START found a STARTED same-name blackout without exact discovered target coverage"
+      return 3
+    fi
   fi
 
   mf_oem_new_temp_file payload_file || return 1
@@ -1197,11 +1246,10 @@ mf_oem_is_blackout_on()
     "$candidates_file" "$inspection_file" || return 1
   mf_oem_print_inspection "$inspection_file" || return 1
   if jq -e '
-       .candidateCount == 1 and
-       .activeCandidateCount == 1 and
-       .status == "STARTED" and
-       .exactTargetIds
-     ' "$inspection_file" >/dev/null
+       (.transitionalCandidateCount // 0) == 0 and
+       (.exactStartedCandidateCount //
+          (if .status == "STARTED" and .exactTargetIds then 1 else 0 end)) > 0
+      ' "$inspection_file" >/dev/null
   then
     printf '         Blackout is ON; all discovered targets are covered.\n'
     return 0
@@ -1235,8 +1283,8 @@ mf_oem_stop_blackout()
   local repository_migration_id="$2"
   local cdb_name="$3"
   local target_container_service="$4"
-  local topology_file targets_file candidates_file inspection_file response_file stop_file
-  local blackout_id status candidate_count
+  local topology_file targets_file candidates_file inspection_file response_file stop_file actual_file
+  local blackout_id status candidate_count started_count exact_started_count
 
   : "$migration_id"
   umask 077
@@ -1259,74 +1307,82 @@ mf_oem_stop_blackout()
     return 1
   fi
   candidate_count=$(jq '.candidateCount' "$inspection_file") || return 1
-  if [ "$candidate_count" -eq 0 ]
+  if [ "$candidate_count" -eq 1 ]
   then
-    mf_oem_warning 'No existing blackout was found; STOP is already complete.'
+    blackout_id=$(jq -r '.blackoutId' "$inspection_file") || return 1
+    status=$(jq -r '.status' "$inspection_file") || return 1
+    case "$status" in
+      STOPPED|ENDED)
+        printf '         Blackout has been %s and is treated as a historical record.\n' "$status"
+        return 0
+        ;;
+      STOP_PENDING)
+        mf_oem_warning 'Blackout has been STOP_PENDING; STOP remains non-blocking.'
+        return 0
+        ;;
+    esac
+    if ! jq -e '.activeCandidateCount == 1 and .exactTargetIds' "$inspection_file" >/dev/null
+    then
+      mf_oem_error "STOP requires one active exact-name blackout with complete discovered target coverage"
+      return 3
+    fi
+    mf_oem_new_temp_file response_file || return 1
+    mf_oem_get_blackout "$blackout_id" "$response_file" || return 1
+    jq -e --arg id "$blackout_id" --arg name "$(mf_oem_blackout_name)" \
+      '.id == $id and .name == $name and .status == "STARTED"' "$response_file" >/dev/null \
+      || mf_oem_error "OEM blackout identity or status changed before STOP" || return 1
+    mf_oem_new_temp_file actual_file || return 1
+    mf_oem_fetch_blackout_targets "$blackout_id" "$actual_file" || return 1
+    mf_oem_target_ids_equal "$targets_file" "$actual_file" \
+      || mf_oem_error "OEM blackout target coverage changed before STOP" || return 1
+    mf_oem_new_temp_file stop_file || return 1
+    MF_OEM_STOP_MUTATION_ATTEMPTED=Y
+    MF_OEM_MUTATION_ATTEMPTED=Y
+    mf_oem_http POST "${MF_OEM_API_BASE_URL}/em/api/blackouts/${blackout_id}/actions/stop" "$stop_file" || return 1
+    mf_oem_expect_http "$MF_OEM_HTTP_STATUS" 204 "Blackout stop" || return 1
+    printf '         Blackout %s has been requested to stop; status is now STOP_PENDING.\n' "$blackout_id"
     return 0
-  elif [ "$candidate_count" -gt 1 ]
+  fi
+  started_count=$(jq '.startedCandidateCount' "$inspection_file") || return 1
+  exact_started_count=$(jq '.exactStartedCandidateCount' "$inspection_file") || return 1
+  if ! jq -e '.transitionalCandidateCount == 0' "$inspection_file" >/dev/null
   then
-    mf_oem_error "STOP found more than one exact canonical OEM blackout"
+    mf_oem_error "STOP found a same-name OEM blackout in a transitional or unsupported state"
     return 3
   fi
-  blackout_id=$(jq -r '.blackoutId' "$inspection_file") || return 1
-  status=$(jq -r '.status' "$inspection_file") || return 1
-  [[ "$blackout_id" =~ ^[A-Za-z0-9._-]+$ ]] \
-    || mf_oem_error "OEM returned an unsafe blackout ID" || return 1
-
-  case "$status" in
-    STOPPED|ENDED)
-      printf '         Blackout has been %s.\n' "$status"
-      printf '%s\n' '         Terminal cleanup is deferred to a later START; no DELETE was attempted.'
-      return 0
-      ;;
-    STOP_PENDING)
-      mf_oem_warning 'Blackout has been STOP_PENDING; STOP remains non-blocking.'
-      printf '%s\n' '         Terminal cleanup is deferred to a later START.'
-      return 0
-      ;;
-  esac
-
-  if ! jq -e '
-       .candidateCount == 1 and
-       .activeCandidateCount == 1 and
-       .exactTargetIds
-     ' "$inspection_file" >/dev/null
+  if [ "$started_count" -eq 0 ]
   then
-    mf_oem_error "STOP requires exactly one active exact-name blackout with complete discovered target coverage"
+    mf_oem_warning 'No active blackout was found; STOP is already complete.'
+    return 0
+  fi
+  if [ "$started_count" -ne "$exact_started_count" ]
+  then
+    mf_oem_error "STOP found a STARTED same-name blackout without exact discovered target coverage"
     return 3
   fi
-  mf_oem_new_temp_file response_file || return 1
-  mf_oem_get_blackout "$blackout_id" "$response_file" || return 1
-  jq -e --arg id "$blackout_id" --arg name "$(mf_oem_blackout_name)" \
-    '.id == $id and .name == $name' "$response_file" >/dev/null \
-    || mf_oem_error "OEM blackout identity changed before STOP" || return 1
-  status=$(jq -r '.status' "$response_file") || return 1
 
-  case "$status" in
-    STARTED)
-      mf_oem_new_temp_file stop_file || return 1
-      MF_OEM_STOP_MUTATION_ATTEMPTED=Y
-      MF_OEM_MUTATION_ATTEMPTED=Y
-      mf_oem_http POST "${MF_OEM_API_BASE_URL}/em/api/blackouts/${blackout_id}/actions/stop" "$stop_file" || return 1
-      mf_oem_expect_http "$MF_OEM_HTTP_STATUS" 204 "Blackout stop" || return 1
-      printf '%s\n' '         Blackout has been requested to stop; status is now STOP_PENDING.'
-      printf '%s\n' '         Terminal cleanup is deferred to a later START.'
-      return 0
-      ;;
-    STOP_PENDING)
-      mf_oem_warning 'Blackout has been STOP_PENDING; STOP remains non-blocking.'
-      printf '%s\n' '         Terminal cleanup is deferred to a later START.'
-      return 0
-      ;;
-    STOPPED|ENDED)
-      printf '         Blackout has been %s.\n' "$status"
-      printf '%s\n' '         Terminal cleanup is deferred to a later START; no DELETE was attempted.'
-      return 0
-      ;;
-    *)
-      mf_oem_error "Canonical OEM blackout changed to non-stoppable status $status"
-      return 4
-      ;;
-  esac
+  if [ "$candidate_count" -gt 1 ]
+  then
+    mf_oem_warning "STOP will request a stop for all $started_count STARTED same-name blackouts."
+  fi
+  for blackout_id in $(jq -r '.inspectedCandidates[] | select(.status == "STARTED" and .exactTargetIds) | .id' "$inspection_file")
+  do
+    mf_oem_new_temp_file response_file || return 1
+    mf_oem_get_blackout "$blackout_id" "$response_file" || return 1
+    jq -e --arg id "$blackout_id" --arg name "$(mf_oem_blackout_name)" \
+      '.id == $id and .name == $name and .status == "STARTED"' "$response_file" >/dev/null \
+      || mf_oem_error "OEM blackout identity or status changed before STOP" || return 1
+    mf_oem_new_temp_file actual_file || return 1
+    mf_oem_fetch_blackout_targets "$blackout_id" "$actual_file" || return 1
+    mf_oem_target_ids_equal "$targets_file" "$actual_file" \
+      || mf_oem_error "OEM blackout target coverage changed before STOP" || return 1
+    mf_oem_new_temp_file stop_file || return 1
+    MF_OEM_STOP_MUTATION_ATTEMPTED=Y
+    MF_OEM_MUTATION_ATTEMPTED=Y
+    mf_oem_http POST "${MF_OEM_API_BASE_URL}/em/api/blackouts/${blackout_id}/actions/stop" "$stop_file" || return 1
+    mf_oem_expect_http "$MF_OEM_HTTP_STATUS" 204 "Blackout stop" || return 1
+    printf '         Blackout %s has been requested to stop; status is now STOP_PENDING.\n' "$blackout_id"
+  done
+  printf '%s\n' '         Terminal cleanup is not required for the blackout lifecycle.'
 
 }

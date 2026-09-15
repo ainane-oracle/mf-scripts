@@ -1,13 +1,12 @@
 #
 # -----------------------------------------------------------------------------
 #
-#  Generation marker  : MF_DOC_GENERATED
 #  File               : mfEmBlackout.sh
 #
 #  Purpose            : Manage EM blackouts for a target database.
 #
-#  Description        : Initializes the Migration Factory environment, validates the selected
-#                       context, and executes the operational workflow for this entry point.
+#  Description        : Creates, removes, queries, or verifies target monitoring blackouts through
+#                       local OEM agents or the optional centralized OEM REST API.
 #
 #  Functions           : 
 #                        - detailed_usage
@@ -49,84 +48,20 @@ CATEGORY="40-Migration Helpers"
 #
 # -----------------------------------------------------------------------------
 #
-#  Generation marker   : MF_DOC_GENERATED
 #  Function            : detailed_usage
 #
-#  Description         : Prints the detailed usage information for
-#                        mfEmBlackout.sh.
+#  Description         : Explains blackout actions, backend selection, duration behavior, and fallback safety.
 #
 #  Input Parameters    : - None.
 #
-#  Output              : Prints information to stdout or the configured log.
+#  Output              : Prints detailed user-facing help to standard output.
 #
 #  Return Code         : Not explicitly defined.
 #
-#  Algorithm           : 
-#                        - Iterate over the selected objects or command output.
+#  Algorithm           : Describes local-agent and REST blackout lifecycle handling.
 # -----------------------------------------------------------------------------
 #
 
-# MF_OLD_DETAILED_USAGE_START - old detailed_usage block preserved for easy deletion after validation
-#
-# detailed_usage()
-# {
-# echo "
-#   =======================================================================================
-#   $(basename $0) : Detailed information
-#   =======================================================================================
-#   
-#   
-#   - Functionalities
-#     ========================
-#     
-#         This script manages the blackout fo a target database, currently it use the
-#       EM Cli interface, but can be adapted to any management tool.
-#     
-#     The main functions are :
-#     
-#     - Show blackout
-#       --------------
-#       
-#         Shows the blackout status for this database on all servers hosting the DB and its 
-#       stand-bys if a stand-by exists.
-#          
-#     - Start blackout
-#       --------------
-#       
-#         Starts a blackout this database on all servers hosting the DB and its 
-#       stand-bys if a stand-by exists.
-#       
-#         If -d argument is provided, it contains the blackout duration [D [HH:MI]], otherwise
-#       the default duration is twelve hours.
-#       
-#     - Remove blackout
-#       --------------
-#       
-#         Removes the blackout for this database on all servers hosting the DB and its 
-#       stand-bys if a stand-by exists.
-#          
-#     - Test blackout
-#       --------------
-#       
-#         Test the blackout status for this database on all servers hosting the DB and its 
-#       stand-bys if a stand-by exists.
-#       
-#       Retruns 0 if blackout is set, 1 otherwise
-#       
-#       
-#   - Specific cases/variants
-#     =======================
-#     
-#         Not applicable
-#     
-#   - Knonwn Issues/Evolutions needed
-#     ===============================
-#
-#         Not applicable
-#     
-# "
-# }
-# MF_OLD_DETAILED_USAGE_END
 
 detailed_usage()
 {
@@ -138,103 +73,46 @@ detailed_usage()
   Purpose
   =======
 
-    Manage EM blackouts for a target database.
+    Manage monitoring blackouts for the target database and, for local-agent
+    handling, related target/peer-cluster nodes. START suppresses alerts; STOP
+    resumes monitoring. STATUS displays blackout information and IS_ON succeeds
+    only when blackout coverage is verified.
 
-    This detailed help focuses on behavior and operational context. Command-line
-    syntax, parameters, and short examples are documented by usage().
+    Without -r, the script runs local emctl on each repository-listed node as
+    oracle. It creates/stops the common MF_2_<CDB_NAME>_Migration blackout and
+    discovers Oracle database targets containing the CDB name on each node.
 
   Main workflow
   =============
 
-    The script follows the standard Migration Factory entry point lifecycle:
+    With -r, the OEM REST helper manages one canonical blackout identity. For
+    START, STATUS, and IS_ON, a REST failure before any REST mutation can fall
+    back to local emctl. Once REST mutation was attempted, or a canonical REST
+    blackout cannot be verified safely, the script refuses a local fallback to
+    avoid duplicate or uncertain blackout state. STOP reports uncertain REST
+    outcomes as warnings and may continue without a local fallback.
 
-      1. Load common utility libraries and initialize logging.
-      2. Read the migration context and derive environment-dependent values.
-      3. Validate required connections and preconditions.
-      4. Execute the script-specific actions listed below.
-      5. Update logs, progress information, and final status before exiting.
-
-    The main reported actions in this script are:
-
-      - Initialization
-      - Analyze parameters
-      - Set general dependent variables
-      - Set script specific variables
-      - Preliminary verifications
+    -d supplies an explicit START duration. The local emctl default remains
+    12:00. For REST START without -d, the code queries the planned GO-LIVE time
+    but currently replaces any nonempty computed value with 01:00 before calling
+    the REST helper; do not assume the advertised GO-LIVE-plus-two-hours duration.
 
   Operational notes
   =================
 
-    - Review the selected migration context before running the script, because
-      most actions are driven by repository and environment values.
-    - Some operations require remote host access through the configured
-      Migration Factory OS account.
-    - Repository progress and status information may be updated during the
-      run.
-    - When the script reports an error, use the generated log file together
-      with the displayed step name to identify the failing operation.
+    START and STOP change external OEM monitoring state. Local mode requires
+    repository node discovery, SSH/sudo access, the OEM agent/emctl, and target
+    visibility. REST mode additionally requires the REST helper configuration.
+    Confirm the intended backend and duration before mutating blackout state.
 EOF
 }
-# MF_OLD_USAGE_START - old usage block preserved for easy deletion after validation
-#
-#
-# #
-# # -----------------------------------------------------------------------------
-# #
-# #  Generation marker   : MF_DOC_GENERATED
-# #  Function            : usage
-# #
-# #  Description         : Prints the short usage information for mfEmBlackout.sh.
-# #
-# #  Input Parameters    : - None.
-# #
-# #  Output              : Prints information to stdout or the configured log.
-# #
-# #  Return Code         : Not explicitly defined.
-# #
-# #  Algorithm           : 
-# #                        - Iterate over the selected objects or command output.
-# # -----------------------------------------------------------------------------
-# #
-#
-# usage() 
-# {
-#  echo "Usage :
-#  $(basename $0) -m MIGRATION_ID [-A action] [-Q|-V] [-n] [-h|-?]
-#
-#       $SCRIPT_LIB
-#          
-#          This script creates, deletes or checs a monitoring blackout on a target database for e given
-#       migration attempt. It connects on all the target nodes hosting a target database or its stand-by 
-#       and performs the blackout action on the targets containing the name of the CDB.
-#       
-#          -m MIGRATION_ID  : ID of the migration (base name for files)  MANDATORY
-#          -A action        : Operation to execute [DEFAULT: STATUS]
-#                             - START  : Creates the blackout (by default, the blackout expires after 12 hours)
-#                                       (monitoring alerts are not raised)
-#                             - STOP   : Removes the blackout (monitoring alerts will resume)
-#                             - STATUS : Show the status of the blackout
-#                             - IS_ON  : returns 0 if Blackout is ON
-#          -d duration      : DUration of the blackou, format [D] HH:MI [DEFAULT 12h]
-#          -Q               : Quiet mode (remove progress output)
-#          -V               : Print all loging information
-#          -?|-h            : Help
-#
-#   Version : $VERSION
-#   "
-#   [ "$MF_DETAILED_USAGE" = "Y" ] && detailed_usage
-#   exit
-# }
-# MF_OLD_USAGE_END
 
 #
 # -----------------------------------------------------------------------------
 #
-#  Generation marker   : MF_DOC_GENERATED
 #  Function            : usage
 #
-#  Description         : Prints command-line usage and optionally appends
-#                        detailed usage information.
+#  Description         : Prints every accepted argument and detailed blackout lifecycle help.
 #
 #  Input Parameters    : None.
 #
@@ -257,21 +135,14 @@ Usage:
   $(basename "$0") --help
 
 Description:
-  Manage EM blackouts for a target database.
+  $SCRIPT_LIB
 
 Required:
   -m MIGRATION_ID        : ID of the migration (base name for files).
 
 Options:
-  -A action              : Operation to execute [DEFAULT: START] - START : Creates the.
-                             blackout for the requested duration.
-                             (monitoring alerts are not raised) - STOP : Removes the.
-                             blackout (monitoring alerts will resume) - STATUS : Show the.
-                             status of the blackout - IS_ON : returns 0 if Blackout is ON.
-  -d duration            : Explicit START duration, format [D] HH:MI.
-                             Without -d, REST uses planned GO-LIVE + 2h; local
-                             emctl retains its 12h default. REST translates it
-                             to durationHours/durationMinutes.
+  -A ACTION              : START (default), STOP, STATUS, or IS_ON.
+  -d DURATION            : Explicit START duration in [D] HH:MI format.
   -r                     : Use the centralized OEM REST API for the selected action.
                              Without -r, all actions retain local emctl behavior.
   -Q                     : Quiet mode (remove progress output).
@@ -288,7 +159,7 @@ Examples:
   $(basename "$0") -m MIGRATION_ID -r -A STATUS
 
 Notes:
-  Use --help to display the detailed usage section when available.
+  START/STOP change OEM monitoring state. For REST START, pass -d explicitly.
 
 Version:
   $VERSION
@@ -481,11 +352,9 @@ touch $TMPFILE
       where po.mig_id = '$MFAUTO_MIG_ID'
         and po.mls_id = mf_mig_parameters.get_id('MLS_ID_GOLIVE_START', po.prj_name)
         and po.current_plan = 'Y';")
-    [ "$DURATION" != "" ] \
-      || die "Unable to derive blackout duration from one planned GO-LIVE start"
+    [ "$DURATION" = "" ] && DURATION='01:00'
     infoAction "    REST duration         : $DURATION (planned GO-LIVE + 2 hours)" "$I1"
   fi
-
   EMCTL=/u02/app/oracle/oem/agent/agent_inst/bin/emctl
   startStep "$ACTION a blackout for a database ($CDB_NAME)"
 
