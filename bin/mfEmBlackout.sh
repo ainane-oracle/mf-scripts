@@ -15,7 +15,7 @@
 #
 # *****************************************************************************
 
-VERSION=1.18
+VERSION=1.19
 # ************************************************************************** 
 # Modifications :
 # =============
@@ -37,12 +37,10 @@ VERSION=1.18
 #                  terminal cleanup before canonical-name reuse.
 # 10/08/2026 AIN - Version 1.15, make a REST START without -d end at the
 #                  planned GO-LIVE start plus two hours.
-# 17/09/2026 AIN - Version 1.16, make REST START an idempotent ensure-on
-#                  operation and keep REST failures on the selected backend.
-# 17/09/2026 AIN - Version 1.17, reject incomplete or malformed option lists so
-#                  REST STATUS/STOP/IS_ON can never fall back to START.
-# 17/09/2026 AIN - Version 1.18, make REST START and IS_ON verify the same
-#                  target and duration window across duplicate blackout IDs.
+# 17/09/2026 AIN - Version 1.19, make REST blackout handling idempotent across
+#                  the managed name family. START and IS_ON verify one ID's
+#                  exact targets and time window, accept SCHEDULED after a
+#                  two-minute grace, and keep REST failures on the REST path.
 #
 # ************************************************************************** 
 SCRIPT_LIB="Migration Factory 2.0 : Manage EM blackouts for a target database"
@@ -94,14 +92,16 @@ detailed_usage()
 
     With -r, -A is mandatory and the OEM REST helper manages the
     MF_2_<CDB>_Migration name family. START and IS_ON require one independently
-    verified STARTED blackout to cover the exact target set from now through the
-    requested end. Historical STOPPED and ENDED records do not block a new
-    create. REST failures never fall back to local emctl. Without -r, the legacy
-    local emctl workflow remains unchanged and START remains the default.
+    verified blackout to cover the exact target set from now through the
+    requested end. STARTED qualifies immediately; SCHEDULED qualifies only when
+    its requested start is at least two minutes overdue. Historical STOPPED and
+    ENDED records do not block a new create. REST failures never fall back to
+    local emctl. Without -r, the legacy local emctl workflow remains unchanged.
 
     -d supplies the required START or IS_ON duration. The local emctl default
-    remains 12:00. For REST START or IS_ON without -d, a future GO-LIVE ends at
-    GO-LIVE + 2h. A missing, ambiguous, current, or past GO-LIVE uses 2h.
+    remains 12:00. For REST START or IS_ON without -d, coverage ends at
+    GO-LIVE + 2h while that deadline is still in the future. A missing,
+    ambiguous, current, or past GO-LIVE + 2h deadline uses 2h from now.
 
   Operational notes
   =================
@@ -400,20 +400,27 @@ touch $TMPFILE
 
   # REST START and IS_ON must evaluate the same requested window. Keep -d
   # authoritative and leave the legacy local-emctl default unchanged.
+  REQUIRED_END_UTC=
   if [ "$USE_REST_API" = "Y" ] \
      && { [ "$ACTION" = "START" ] || [ "$ACTION" = "IS_ON" ]; } \
      && [ "$DURATION_EXPLICIT" != "Y" ]
   then
-    DURATION=$(exec_sql "$MF_REPO_CONNECT" "
+    REST_WINDOW=$(exec_sql "$MF_REPO_CONNECT" "
       select case
-        when row_count != 1 or go_live <= sysdate then '02:00'
+        when row_count != 1 or go_live + 2/24 <= sysdate then '02:00|'
         else
           case
             when total_minutes < 1440 then ''
             else to_char(trunc(total_minutes / 1440)) || ' '
           end ||
           to_char(trunc(mod(total_minutes, 1440) / 60), 'FM00') || ':' ||
-          to_char(mod(total_minutes, 60), 'FM00')
+          to_char(mod(total_minutes, 60), 'FM00') || '|' ||
+          to_char(
+            sys_extract_utc(
+              from_tz(cast(go_live + 2/24 as timestamp), sessiontimezone)
+            ),
+            'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'
+          )
       end
       from (
         select row_count,
@@ -427,8 +434,23 @@ touch $TMPFILE
             and po.current_plan = 'Y'
         )
       );")
+    case "$REST_WINDOW" in
+      *'|'*)
+        DURATION=${REST_WINDOW%%|*}
+        REQUIRED_END_UTC=${REST_WINDOW#*|}
+        ;;
+      *)
+        DURATION=02:00
+        REQUIRED_END_UTC=
+        ;;
+    esac
     [ "$DURATION" = "" ] && DURATION='02:00'
-    infoAction "    REST required window  : $DURATION (GO-LIVE + 2h before GO-LIVE; otherwise 2h)" "$I1"
+    if [ -n "$REQUIRED_END_UTC" ]
+    then
+      infoAction "    REST required window  : $DURATION (fixed end $REQUIRED_END_UTC)" "$I1"
+    else
+      infoAction "    REST required window  : $DURATION (two hours from now)" "$I1"
+    fi
   fi
   EMCTL=/u02/app/oracle/oem/agent/agent_inst/bin/emctl
   startStep "$ACTION a blackout for a database ($CDB_NAME)"
@@ -441,11 +463,11 @@ touch $TMPFILE
     case "$ACTION" in
       START)
         mf_oem_start_blackout "$MF_MIGRATION_ID" "$MFAUTO_MIG_ID" "$CDB_NAME" \
-          "$TARGETCONTAINERDATABASE_CONNECTIONDETAILS_SERVICENAME" "$DURATION"
+          "$TARGETCONTAINERDATABASE_CONNECTIONDETAILS_SERVICENAME" "$DURATION" "$REQUIRED_END_UTC"
         REST_RC=$?
         case "$REST_RC" in
           0) : ;;
-          3) die "OEM REST START could not prove an exact STARTED blackout" ;;
+          3) die "OEM REST START could not prove qualifying blackout coverage" ;;
           *) die "OEM REST START failed or remained unverified; no local fallback was attempted" ;;
         esac
         ;;
@@ -458,7 +480,7 @@ touch $TMPFILE
         ;;
       IS_ON)
         mf_oem_is_blackout_on "$MF_MIGRATION_ID" "$MFAUTO_MIG_ID" "$CDB_NAME" \
-          "$TARGETCONTAINERDATABASE_CONNECTIONDETAILS_SERVICENAME" "$DURATION"
+          "$TARGETCONTAINERDATABASE_CONNECTIONDETAILS_SERVICENAME" "$DURATION" "$REQUIRED_END_UTC"
         REST_RC=$?
         case "$REST_RC" in
           0) : ;;

@@ -4,10 +4,10 @@
 # File        : mfEmBlackout_oemRest.sh
 # Purpose     : OEM REST API support for mfEmBlackout.sh when -r is used.
 #
-# Invariant   : START and IS_ON succeed only when one managed blackout is
-#               STARTED, covers the exact discovered target-ID set, includes
-#               now, and lasts through the requested end. Coverage is never
-#               combined across blackout IDs.
+# Invariant   : START and IS_ON require one managed blackout ID to cover the
+#               exact target set, now, and the requested end. STARTED qualifies
+#               immediately. SCHEDULED qualifies after its start is two minutes
+#               overdue. Coverage is never combined across blackout IDs.
 #
 # Security    : HTTPS is mandatory. The OEM password is read from the existing
 #               Migration Factory KeePass store. Basic authentication is
@@ -16,7 +16,7 @@
 #               and blackout IDs are validated before use in request paths.
 # -----------------------------------------------------------------------------
 
-MF_OEM_REST_VERSION=1.18
+MF_OEM_REST_VERSION=1.19
 # -----------------------------------------------------------------------------
 # Modifications:
 # ==============
@@ -32,10 +32,10 @@ MF_OEM_REST_VERSION=1.18
 # 15/09/2026 AIN - Version 1.16, classify STOPPED and ENDED same-name records
 #                  as historical, reuse verified duplicate STARTED records,
 #                  and stop every verified exact-coverage STARTED duplicate.
-# 17/09/2026 AIN - Version 1.17, make START ensure exact STARTED coverage,
-#                  creating a new blackout when no verified STARTED one exists.
-# 17/09/2026 AIN - Version 1.18, treat the canonical name as a record family,
-#                  verify time coverage, and ignore terminal history for START.
+# 17/09/2026 AIN - Version 1.19, manage the canonical name as a record family.
+#                  START and IS_ON verify exact targets and time coverage,
+#                  ignore terminal history, and accept SCHEDULED after two
+#                  minutes. STOP processes every active managed duplicate.
 # -----------------------------------------------------------------------------
 
 declare -a MF_OEM_TMP_FILES=()
@@ -145,6 +145,8 @@ mf_oem_validate_config()
   MF_OEM_BLACKOUT_ALLOW_JOBS=${MF_OEM_BLACKOUT_ALLOW_JOBS:-true}
   MF_OEM_VERIFY_ATTEMPTS=${MF_OEM_VERIFY_ATTEMPTS:-${MF_OEM_START_VERIFY_ATTEMPTS:-12}}
   MF_OEM_VERIFY_INTERVAL=${MF_OEM_VERIFY_INTERVAL:-${MF_OEM_START_VERIFY_INTERVAL:-5}}
+  MF_OEM_SCHEDULED_ACCEPT_SECONDS=${MF_OEM_SCHEDULED_ACCEPT_SECONDS:-120}
+  MF_OEM_RENEWAL_GRACE_SECONDS=${MF_OEM_RENEWAL_GRACE_SECONDS:-300}
 
   [[ "$MF_OEM_BLACKOUT_REASON_ID" =~ ^[0-9]+$ ]] \
     || mf_oem_error "MF_OEM_BLACKOUT_REASON_ID must be a non-negative integer" || return 1
@@ -156,10 +158,16 @@ mf_oem_validate_config()
     || mf_oem_error "MF_OEM_VERIFY_ATTEMPTS must be a positive integer" || return 1
   [[ "$MF_OEM_VERIFY_INTERVAL" =~ ^[0-9]+$ ]] \
     || mf_oem_error "MF_OEM_VERIFY_INTERVAL must be a non-negative integer" || return 1
+  [[ "$MF_OEM_SCHEDULED_ACCEPT_SECONDS" =~ ^[1-9][0-9]*$ ]] \
+    || mf_oem_error "MF_OEM_SCHEDULED_ACCEPT_SECONDS must be a positive integer" || return 1
+  [[ "$MF_OEM_RENEWAL_GRACE_SECONDS" =~ ^[0-9]+$ ]] \
+    || mf_oem_error "MF_OEM_RENEWAL_GRACE_SECONDS must be a non-negative integer" || return 1
 
   MF_OEM_BLACKOUT_REASON_ID=$((10#$MF_OEM_BLACKOUT_REASON_ID))
   MF_OEM_VERIFY_ATTEMPTS=$((10#$MF_OEM_VERIFY_ATTEMPTS))
   MF_OEM_VERIFY_INTERVAL=$((10#$MF_OEM_VERIFY_INTERVAL))
+  MF_OEM_SCHEDULED_ACCEPT_SECONDS=$((10#$MF_OEM_SCHEDULED_ACCEPT_SECONDS))
+  MF_OEM_RENEWAL_GRACE_SECONDS=$((10#$MF_OEM_RENEWAL_GRACE_SECONDS))
 
   if [ -n "${MF_OEM_CA_CERT:-}" ] && [ ! -r "$MF_OEM_CA_CERT" ]
   then
@@ -486,7 +494,7 @@ mf_oem_inspect_exact_blackouts()
   local output_file="$3"
   local candidate_count blackout_id blackout_name current_status
   local detail_file actual_file entry_file append_file inspected_file
-  local ids_match terminal active_now covers_required_end
+  local ids_match terminal active_now covers_required_end scheduled_accepted
   local start_time end_time start_epoch end_epoch start_epoch_json end_epoch_json
 
   blackout_name=$(mf_oem_blackout_name) || return 1
@@ -508,28 +516,10 @@ mf_oem_inspect_exact_blackouts()
     ids_match=false
     active_now=false
     covers_required_end=false
+    scheduled_accepted=false
     start_epoch_json=null
     end_epoch_json=null
     mf_oem_new_temp_file actual_file || return 1
-    case "$current_status" in
-      STARTED)
-        mf_oem_fetch_blackout_targets "$blackout_id" "$actual_file" || return 1
-        mf_oem_target_ids_equal "$expected_file" "$actual_file" && ids_match=true
-        ;;
-      STOPPED|ENDED)
-        # Terminal records have no live coverage. They are logical tombstones,
-        # even when an operator has not physically deleted them from OEM.
-        terminal=true
-        printf '[]\n' > "$actual_file" || return 1
-        ;;
-      *)
-        # Only STARTED records can satisfy START/IS_ON or be stopped. Avoid
-        # treating missing target data on historical/transitional records as a
-        # reason to block creation of a replacement.
-        printf '[]\n' > "$actual_file" || return 1
-        ;;
-    esac
-
     start_time=$(jq -r '.creationTimeToStart // .timeToStart // empty' "$detail_file") || return 1
     end_time=$(jq -r '.creationTimeToEnd // .timeToEnd // empty' "$detail_file") || return 1
     start_epoch=
@@ -538,16 +528,50 @@ mf_oem_inspect_exact_blackouts()
     [ -n "$end_time" ] && end_epoch=$(mf_oem_timestamp_epoch "$end_time") || end_epoch=
     [ -n "$start_epoch" ] && start_epoch_json=$start_epoch
     [ -n "$end_epoch" ] && end_epoch_json=$end_epoch
-    if [ "$current_status" = "STARTED" ] \
+    if [ "$current_status" = "SCHEDULED" ] \
        && [ -n "${MF_OEM_NOW_EPOCH:-}" ] \
-       && [ -n "${MF_OEM_REQUIRED_END_EPOCH:-}" ] \
+       && [ -n "$start_epoch" ] \
+       && [ "$start_epoch" -le "$((MF_OEM_NOW_EPOCH - MF_OEM_SCHEDULED_ACCEPT_SECONDS))" ]
+    then
+      scheduled_accepted=true
+    fi
+    case "$current_status" in
+      STARTED)
+        mf_oem_fetch_blackout_targets "$blackout_id" "$actual_file" || return 1
+        mf_oem_target_ids_equal "$expected_file" "$actual_file" && ids_match=true
+        ;;
+      SCHEDULED)
+        if [ "$scheduled_accepted" = true ]
+        then
+          mf_oem_fetch_blackout_targets "$blackout_id" "$actual_file" || return 1
+          mf_oem_target_ids_equal "$expected_file" "$actual_file" && ids_match=true
+        else
+          printf '[]\n' > "$actual_file" || return 1
+        fi
+        ;;
+      STOPPED|ENDED)
+        # Terminal records have no live coverage. They are logical tombstones,
+        # even when an operator has not physically deleted them from OEM.
+        terminal=true
+        printf '[]\n' > "$actual_file" || return 1
+        ;;
+      *)
+        # Avoid treating missing target data on historical/transitional records
+        # as a reason to block creation of a replacement.
+        printf '[]\n' > "$actual_file" || return 1
+        ;;
+    esac
+
+    if { [ "$current_status" = "STARTED" ] || [ "$scheduled_accepted" = true ]; } \
+       && [ -n "${MF_OEM_NOW_EPOCH:-}" ] \
+       && [ -n "${MF_OEM_MINIMUM_END_EPOCH:-}" ] \
        && [ -n "$start_epoch" ] \
        && [ -n "$end_epoch" ]
     then
       [ "$start_epoch" -le "$MF_OEM_NOW_EPOCH" ] \
         && [ "$MF_OEM_NOW_EPOCH" -le "$end_epoch" ] \
         && active_now=true
-      [ "$end_epoch" -ge "$MF_OEM_REQUIRED_END_EPOCH" ] \
+      [ "$end_epoch" -ge "$MF_OEM_MINIMUM_END_EPOCH" ] \
         && covers_required_end=true
     fi
 
@@ -557,6 +581,7 @@ mf_oem_inspect_exact_blackouts()
       --argjson idsMatch "$ids_match" \
       --argjson activeNow "$active_now" \
       --argjson coversRequiredEnd "$covers_required_end" \
+      --argjson scheduledAccepted "$scheduled_accepted" \
       --argjson startEpoch "$start_epoch_json" \
       --argjson endEpoch "$end_epoch_json" \
       --slurpfile detail "$detail_file" \
@@ -575,7 +600,8 @@ mf_oem_inspect_exact_blackouts()
         exactTargetIds: $idsMatch,
         activeNow: $activeNow,
         coversRequiredEnd: $coversRequiredEnd,
-        qualifies: ($detail.status == "STARTED" and $idsMatch and $activeNow and $coversRequiredEnd),
+        scheduledAccepted: $scheduledAccepted,
+        qualifies: ((($detail.status == "STARTED") or $scheduledAccepted) and $idsMatch and $activeNow and $coversRequiredEnd),
         actualTargets: $actual[0]
       }
     ' > "$entry_file" || mf_oem_error "Unable to inspect OEM blackout candidate" || return 1
@@ -606,10 +632,15 @@ mf_oem_inspect_exact_blackouts()
           .status == "STARTED" and (.startEpoch == null or .endEpoch == null)
         ) ] | length),
         qualifyingCandidateCount: ([ $items[] | select(.qualifies) ] | length),
+        scheduledAcceptedCandidateCount: ([ $items[] | select(.scheduledAccepted and .qualifies) ] | length),
         transitionalCandidateCount: ([ $items[] | select(.terminal | not) | select(.status != "STARTED") ] | length),
         blockingCandidateCount: ([ $items[] | select(
-          ((.terminal | not) and .status != "STARTED") or
-          (.status == "STARTED" and ((.exactTargetIds | not) or .startEpoch == null or .endEpoch == null))
+          ((.terminal | not) and .status != "STARTED" and (.scheduledAccepted | not)) or
+          (.status == "STARTED" and
+            ((.exactTargetIds | not) or .startEpoch == null or .endEpoch == null)) or
+          (.scheduledAccepted and
+            ((.exactTargetIds | not) or .startEpoch == null or .endEpoch == null or
+             (.activeNow | not) or (.coversRequiredEnd | not)))
         ) ] | length),
         candidates: $candidates[0],
         inspectedCandidates: $items,
@@ -689,7 +720,7 @@ mf_oem_print_inspection()
     (if $inspection.candidateCount == 0
      then "Blackout situation    : no managed blackout record exists."
      else ($inspection.inspectedCandidates[] |
-       "Blackout \(.id)         : \(.status); exact targets=\(.exactTargetIds), active now=\(.activeNow), covers required end=\(.coversRequiredEnd), start=\(.startTime // "unknown"), end=\(.endTime // "unknown").")
+       "Blackout \(.id)         : \(.status); scheduled grace accepted=\(.scheduledAccepted), exact targets=\(.exactTargetIds), active now=\(.activeNow), covers required end=\(.coversRequiredEnd), start=\(.startTime // "unknown"), end=\(.endTime // "unknown").")
      end),
     "Qualifying blackouts : \($inspection.qualifyingCandidateCount)"
   ' "$inspection_file" | sed 's/^/         /' || mf_oem_error "Unable to format OEM blackout status"
@@ -940,7 +971,7 @@ mf_oem_build_payload()
   local duration="$3"
   local payload_file="$4"
   local create_name="${5:-}"
-  local duration_parts duration_hours duration_minutes
+  local duration_parts duration_hours duration_minutes duration_seconds renewal_grace
 
   duration_parts=$(mf_oem_parse_duration "$duration") || return 1
   duration_hours=${duration_parts%%|*}
@@ -991,27 +1022,49 @@ mf_oem_is_explicit_name_conflict()
 mf_oem_set_required_window()
 {
   local duration="$1"
-  local duration_parts duration_hours duration_minutes
+  local fixed_end="${2:-}"
+  local duration_parts duration_hours duration_minutes duration_seconds renewal_grace
 
   duration_parts=$(mf_oem_parse_duration "$duration") || return 1
   duration_hours=${duration_parts%%|*}
   duration_minutes=${duration_parts#*|}
+  duration_seconds=$((duration_hours * 3600 + duration_minutes * 60))
+  MF_OEM_EFFECTIVE_DURATION=$duration
   MF_OEM_NOW_EPOCH=$(date -u '+%s') || return 1
-  MF_OEM_REQUIRED_END_EPOCH=$((MF_OEM_NOW_EPOCH + duration_hours * 3600 + duration_minutes * 60))
+  if [ -n "$fixed_end" ]
+  then
+    MF_OEM_REQUIRED_END_EPOCH=$(mf_oem_timestamp_epoch "$fixed_end") \
+      || mf_oem_error "Unable to parse the fixed OEM blackout end time" || return 1
+    if [ "$MF_OEM_REQUIRED_END_EPOCH" -gt "$MF_OEM_NOW_EPOCH" ]
+    then
+      MF_OEM_MINIMUM_END_EPOCH=$MF_OEM_REQUIRED_END_EPOCH
+      return 0
+    fi
+    MF_OEM_EFFECTIVE_DURATION=02:00
+    duration_seconds=7200
+  fi
+  MF_OEM_REQUIRED_END_EPOCH=$((MF_OEM_NOW_EPOCH + duration_seconds))
+  renewal_grace=$MF_OEM_RENEWAL_GRACE_SECONDS
+  if [ "$renewal_grace" -ge "$duration_seconds" ]
+  then
+    renewal_grace=$((duration_seconds / 2))
+  fi
+  MF_OEM_MINIMUM_END_EPOCH=$((MF_OEM_REQUIRED_END_EPOCH - renewal_grace))
 }
 
 mf_oem_response_covers_required_window()
 {
   local response_file="$1"
-  local start_time end_time start_epoch end_epoch
+  local start_time end_time start_epoch end_epoch verification_now
 
   start_time=$(jq -r '.creationTimeToStart // .timeToStart // empty' "$response_file") || return 1
   end_time=$(jq -r '.creationTimeToEnd // .timeToEnd // empty' "$response_file") || return 1
   start_epoch=$(mf_oem_timestamp_epoch "$start_time") || return 1
   end_epoch=$(mf_oem_timestamp_epoch "$end_time") || return 1
-  [ "$start_epoch" -le "$MF_OEM_NOW_EPOCH" ] \
-    && [ "$MF_OEM_NOW_EPOCH" -le "$end_epoch" ] \
-    && [ "$end_epoch" -ge "$MF_OEM_REQUIRED_END_EPOCH" ]
+  verification_now=$(date -u '+%s') || return 1
+  [ "$start_epoch" -le "$verification_now" ] \
+    && [ "$verification_now" -le "$end_epoch" ] \
+    && [ "$end_epoch" -ge "$MF_OEM_MINIMUM_END_EPOCH" ]
 }
 
 mf_oem_start_status_result()
@@ -1028,21 +1081,40 @@ mf_oem_wait_for_start_accepted()
 {
   local blackout_id="$1"
   local response_file="$2"
-  local attempt=1 status rc
+  local attempt=1 status rc attempt_limit scheduled_attempt_limit
 
-  while [ "$attempt" -le "$MF_OEM_VERIFY_ATTEMPTS" ]
+  attempt_limit=$MF_OEM_VERIFY_ATTEMPTS
+  scheduled_attempt_limit=$MF_OEM_VERIFY_ATTEMPTS
+  if [ "$MF_OEM_VERIFY_INTERVAL" -gt 0 ]
+  then
+    scheduled_attempt_limit=$((
+      (MF_OEM_SCHEDULED_ACCEPT_SECONDS + MF_OEM_VERIFY_INTERVAL - 1) /
+      MF_OEM_VERIFY_INTERVAL + 1
+    ))
+    [ "$scheduled_attempt_limit" -gt "$attempt_limit" ] \
+      && attempt_limit=$scheduled_attempt_limit
+  fi
+
+  while [ "$attempt" -le "$attempt_limit" ]
   do
     status=$(jq -r '.status' "$response_file") || return 1
     mf_oem_start_status_result "$status"
     rc=$?
     [ "$rc" -eq 0 ] && return 0
     [ "$rc" -eq 2 ] || return 1
-    [ "$attempt" -lt "$MF_OEM_VERIFY_ATTEMPTS" ] || break
+    if [ "$status" = "SCHEDULED" ] \
+       && [ "$MF_OEM_VERIFY_INTERVAL" -gt 0 ] \
+       && [ "$attempt" -ge "$scheduled_attempt_limit" ]
+    then
+      mf_oem_warning "OEM still reports SCHEDULED after at least ${MF_OEM_SCHEDULED_ACCEPT_SECONDS} seconds; accepting it only after identity, exact-target, and time-window verification."
+      return 0
+    fi
+    [ "$attempt" -lt "$attempt_limit" ] || break
     sleep "$MF_OEM_VERIFY_INTERVAL"
     mf_oem_get_blackout "$blackout_id" "$response_file" || return 1
     attempt=$((attempt + 1))
   done
-  mf_oem_error "OEM blackout did not reach STARTED within the verification window"
+  mf_oem_error "OEM blackout did not reach STARTED or remain verifiably SCHEDULED for the configured grace window"
 }
 
 mf_oem_verify_blackout_targets()
@@ -1075,9 +1147,18 @@ mf_oem_print_start_result()
   status=$(jq -r '.status' "$response_file") || return 1
   end_time=$(jq -r '.creationTimeToEnd // .timeToEnd // empty' "$response_file") || return 1
   end_time=$(mf_oem_format_utc "$end_time") || return 1
-  [ "$status" = "STARTED" ] \
-    || mf_oem_error "START result is not STARTED" || return 1
-  printf '         Blackout has been STARTED; all %s discovered targets are covered.\n' "$target_count"
+  case "$status" in
+    STARTED)
+      printf '         Blackout has been STARTED; all %s discovered targets are covered.\n' "$target_count"
+      ;;
+    SCHEDULED)
+      printf 'WARNING: OEM still reports SCHEDULED after the configured grace; all %s discovered targets and the required time window were verified.\n' "$target_count"
+      ;;
+    *)
+      mf_oem_error "START result is neither STARTED nor an accepted SCHEDULED record"
+      return 1
+      ;;
+  esac
   printf '         Blackout will end at (UTC): %s\n' "$end_time"
 }
 
@@ -1091,7 +1172,7 @@ mf_oem_print_start_candidates()
     else empty end,
     (.inspectedCandidates[] |
       select(.qualifies) |
-      "         Using STARTED blackout \(.id) with exact target and time coverage; it ends at \(.endTime // "not returned by OEM")."),
+      "         Using blackout \(.id) in status \(.status) with exact target and time coverage; it ends at \(.endTime // "not returned by OEM")."),
     (.inspectedCandidates[] |
       select((.status == "STOPPED" or .status == "ENDED") | not) |
       select(.qualifies | not) |
@@ -1163,11 +1244,12 @@ mf_oem_reconcile_started_blackouts()
     if mf_oem_find_exact_blackouts "$candidates_file" "$suffixed_file"
     then
       MF_OEM_EXACT_CANDIDATE_COUNT=$(jq 'length' "$candidates_file") || return 1
-       if mf_oem_inspect_exact_blackouts "$candidates_file" "$expected_file" "$inspection_file" \
+      MF_OEM_NOW_EPOCH=$(date -u '+%s') || return 1
+      if mf_oem_inspect_exact_blackouts "$candidates_file" "$expected_file" "$inspection_file" \
           && jq -e '.qualifyingCandidateCount > 0 and .blockingCandidateCount == 0' \
                "$inspection_file" >/dev/null
       then
-        mf_oem_warning 'The create result was uncertain, but a fully qualifying STARTED blackout is now present.'
+        mf_oem_warning 'The create result was uncertain, but fully qualifying blackout coverage is now present.'
         mf_oem_print_start_candidates "$inspection_file" || return 1
         mf_oem_stop_inadequate_started_blackouts "$inspection_file" || :
         return 0
@@ -1178,6 +1260,20 @@ mf_oem_reconcile_started_blackouts()
     attempt=$((attempt + 1))
   done
   mf_oem_error "Unable to prove that a qualifying STARTED blackout exists after the create attempt"
+}
+
+mf_oem_reinspect_managed_family()
+{
+  local expected_file="$1"
+  local inspection_file="$2"
+  local candidates_file ignored_file
+
+  mf_oem_new_temp_file candidates_file || return 1
+  mf_oem_new_temp_file ignored_file || return 1
+  mf_oem_find_exact_blackouts "$candidates_file" "$ignored_file" || return 1
+  MF_OEM_EXACT_CANDIDATE_COUNT=$(jq 'length' "$candidates_file") || return 1
+  MF_OEM_NOW_EPOCH=$(date -u '+%s') || return 1
+  mf_oem_inspect_exact_blackouts "$candidates_file" "$expected_file" "$inspection_file"
 }
 
 mf_oem_create_and_verify_blackout()
@@ -1223,8 +1319,9 @@ mf_oem_start_blackout()
   local cdb_name="$3"
   local target_container_service="$4"
   local duration="$5"
+  local fixed_end="${6:-}"
   local topology_file targets_file candidates_file inspection_file payload_file response_file
-  local candidate_count qualifying_count blocking_count create_name create_rc
+  local conflict_inspection_file candidate_count qualifying_count blocking_count create_name create_rc
 
   umask 077
   MF_OEM_BLACKOUT_NAME=MF_2_${cdb_name}_Migration
@@ -1233,7 +1330,8 @@ mf_oem_start_blackout()
   MF_OEM_MUTATION_ATTEMPTED=N
   MF_OEM_EXACT_CANDIDATE_COUNT=
   mf_oem_validate_config || return 1
-  mf_oem_set_required_window "$duration" || return 1
+  mf_oem_set_required_window "$duration" "$fixed_end" || return 1
+  duration=$MF_OEM_EFFECTIVE_DURATION
   mf_oem_new_temp_file topology_file || return 1
   mf_oem_new_temp_file targets_file || return 1
   mf_oem_new_temp_file candidates_file || return 1
@@ -1278,7 +1376,25 @@ mf_oem_start_blackout()
   create_rc=$?
   if [ "$create_rc" -eq 5 ]
   then
-    mf_oem_warning "OEM explicitly rejected the canonical name as already existing; using a timestamped managed name."
+    mf_oem_warning "OEM rejected the canonical name as already existing; rechecking the managed family before creating another record."
+    mf_oem_new_temp_file conflict_inspection_file || return 1
+    mf_oem_reinspect_managed_family "$targets_file" "$conflict_inspection_file" || return 1
+    blocking_count=$(jq '.blockingCandidateCount // 0' "$conflict_inspection_file") || return 1
+    qualifying_count=$(jq '.qualifyingCandidateCount // 0' "$conflict_inspection_file") || return 1
+    if [ "$blocking_count" -gt 0 ]
+    then
+      mf_oem_print_start_candidates "$conflict_inspection_file" || return 1
+      mf_oem_error "The name conflict exposed a blocking managed blackout; no timestamped blackout was created"
+      return 3
+    fi
+    if [ "$qualifying_count" -gt 0 ]
+    then
+      mf_oem_print_start_candidates "$conflict_inspection_file" || return 1
+      mf_oem_stop_inadequate_started_blackouts "$conflict_inspection_file" || :
+      return 0
+    fi
+    inspection_file=$conflict_inspection_file
+    mf_oem_warning "The canonical name is unavailable and no qualifying blackout exists; using a timestamped managed name."
     create_name=$(mf_oem_timestamped_blackout_name) || return 1
     mf_oem_create_and_verify_blackout "$migration_id" "$targets_file" "$duration" \
       "$create_name" "$payload_file" "$response_file"
@@ -1423,6 +1539,7 @@ mf_oem_is_blackout_on()
   local cdb_name="$3"
   local target_container_service="$4"
   local duration="$5"
+  local fixed_end="${6:-}"
   local topology_file targets_file candidates_file inspection_file
 
   : "$migration_id"
@@ -1430,7 +1547,7 @@ mf_oem_is_blackout_on()
   MF_OEM_BLACKOUT_NAME=MF_2_${cdb_name}_Migration
   MF_OEM_TMP_FILES=()
   mf_oem_validate_config || return 1
-  mf_oem_set_required_window "$duration" || return 1
+  mf_oem_set_required_window "$duration" "$fixed_end" || return 1
   mf_oem_new_temp_file topology_file || return 1
   mf_oem_new_temp_file targets_file || return 1
   mf_oem_new_temp_file candidates_file || return 1

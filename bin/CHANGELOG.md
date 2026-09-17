@@ -1,83 +1,30 @@
 # Migration Factory `bin` changelog
 
-## 2026-09-17 - Time-qualified OEM blackout family - helper v1.18 / entry point v1.18
+## 2026-09-17 - Idempotent OEM REST blackouts - v1.19
 
 ### Changed
 
-- `MF_2_<CDB>_Migration` remains the preferred create name, but it is no longer
-  treated as a unique record. Migration Factory manages the exact base name and
-  names with the strict `_YYYYMMDDTHHMMSSZ` suffix. A timestamped name is tried
-  only when OEM explicitly rejects the base name as a duplicate/name-uniqueness
-  conflict; transport errors and uncertain responses are reconciled without a
-  second create under another name.
-- `START` and `IS_ON` now use the same contract. At least one individual
-  `STARTED` record must have the exact discovered target-ID set, include the
-  current time, and last through the requested end. Duplicate coverage is never
-  combined across OEM IDs.
-- Without `-d`, both actions require coverage through planned GO-LIVE plus two
-  hours when GO-LIVE is uniquely defined and still in the future. Missing,
-  ambiguous, current, or past GO-LIVE falls back to two hours from now. An
-  explicit `-d` overrides this rule for both actions.
-- `STOPPED` and `ENDED` records are historical: they remain visible in `STATUS`
-  but never block `START` and are never deleted. `STATUS` lists every managed
-  record with its immutable ID, name, status, start, and end.
-- When only inadequate `STARTED` records exist, `START` first creates and
-  verifies replacement coverage, then best-effort stops the old records.
-  Transitional, failed, partial, unknown, or unverifiable records still fail
-  closed and do not permit a competing create.
-- `STOP` processes every managed-family ID. It requests stop for every
-  `STARTED` record regardless of current target coverage, treats
-  `STOP_PENDING`/`STOPPED`/`ENDED` as idempotent no-ops, continues after an
-  individual failure, treats an ID concurrently removed from OEM as already
-  stopped, and returns nonzero when any result remains unverified.
-- The stable and unstable callers run `START` only when `IS_ON` returns the
-  definitive not-covered code `3`. Other `IS_ON` failures remain fatal. The
-  30-minute callers pass the same `-d 00:30` to both checks; the target-PDB flow
-  uses the shared GO-LIVE/default duration rule.
-- The local `emctl` workflow is unchanged when `-r` is not supplied.
-
-## 2026-09-17 - OEM REST blackout ensure-on - helper v1.17 / entry point v1.17
-
-### Changed
-
-- `START` is now an ensure-on operation. It succeeds without mutation when at
-  least one same-name blackout is independently verified as `STARTED` with the
-  exact currently discovered target-ID set. Otherwise it creates a new
-  same-name blackout; `STOPPED`, `ENDED`, scheduled, transitional, failed,
-  partial, unknown, and coverage-mismatched records do not block that create.
-- A newly created blackout must reach `STARTED` and exact target coverage before
-  `START` reports success. A lost or unexpected create response is reconciled by
-  re-listing and re-verifying the same-name records; uncertainty remains an
-  error.
-- Before creation, a failed list/detail snapshot is retried as a complete unit.
-  Creation still requires one successful snapshot that proves no exact
-  `STARTED` candidate exists.
-- `IS_ON` uses the same existential rule: any independently verified exact
-  `STARTED` record means ON, even when lifecycle history or transitional records
-  also exist.
-- The obsolete target `PATCH`, terminal `DELETE`, and STOP_PENDING cleanup paths
-  were removed. Existing records are not altered or deleted by `START`.
-- `STOP` retries can proceed past a duplicate already in `STOP_PENDING` and stop
-  the remaining independently verified exact `STARTED` duplicates. Changed
-  coverage, failed, partial, and unknown states still fail closed.
-- A lost or unexpected STOP response is reconciled against the same immutable
-  blackout ID. Duplicate fan-out continues for the remaining verified IDs, and
-  the command returns nonzero if any individual outcome remains unverified.
-- Selecting REST with `-r` no longer falls back to local `emctl` after a REST
-  failure. Without `-r`, the local `emctl` path is unchanged.
-- REST mode now requires an explicit `-A`. The parser rejects unknown options,
-  missing option values, stray positional arguments, and non-ASCII option
-  dashes before any REST helper can run. Local mode still defaults to `START`
-  when `-A` is omitted.
-- Without an explicit `-d`, a past GO-LIVE date now means a fresh two-hour REST
-  blackout; it does not reuse the expired planned end time.
-
-### Caller boundary
-
-- `mfDbActions.sh`, `mfCreateTargetPDB.sh`, and `mfUpdateparams.sh` (stable and
-  unstable copies) already stop their workflow when REST `START` returns
-  nonzero. This preserves the required boundary: an unavailable OEM or an
-  unverified exact `STARTED` blackout cannot be reported as success.
+- Migration Factory now manages `MF_2_<CDB>_Migration` and its strict timestamp
+  suffixes as one family. It creates with the base name first. It uses a suffix
+  only after OEM reports a name conflict and a fresh inspection finds no usable
+  record or blocker. Uncertain create responses are reconciled without another
+  create attempt.
+- `START` and `IS_ON` use the same rule. One immutable OEM ID must have the exact
+  discovered target IDs, cover now, and cover the requested end. `STARTED`
+  qualifies immediately. `SCHEDULED` qualifies after its requested start has
+  been overdue for two minutes and the same target and time checks pass. Other
+  transitional, failed, partial, unknown, or unverifiable records block.
+- `STOPPED` and `ENDED` are history. They appear in `STATUS`, do not block a new
+  blackout, and are not deleted. `STOP` requests a stop for every active managed
+  duplicate and reports failure if any result cannot be verified.
+- Without `-d`, START and IS_ON require coverage through GO-LIVE plus two hours.
+  After that deadline, or when GO-LIVE is missing or ambiguous, they require two
+  hours from now. `-d` overrides this rule. Relative windows allow five minutes
+  of retry drift so immediate retries do not replace valid coverage.
+- REST mode requires an explicit valid action and never falls back to local
+  `emctl`. Callers run START only after IS_ON returns code `3`; other errors stop
+  the workflow. Local `emctl` behavior and its APEX actions remain unchanged
+  when `-r` is absent.
 
 ## 2026-09-16 - `mfEmBlackout_oemRest.sh` - v1.16
 
@@ -164,7 +111,7 @@ EXCLUDEOBJECTS-1=owner:PR_TOR,objectType:TABLE,objectName:PLAN_TABLE
 ZDM consequently raised PRGZ-3621, reporting the same parameter with a blank first value and a populated second value.
 The fix changes the response generator so that the blank template entry is retained only when both schema and table exclusion lists are empty. If table exclusions exist, they replace the placeholder directly.
 The correction was applied to the stable and unstable versions of mfUtils_03_rspManagement.sh. Change history was added with date 12/08/2026 and responsible AIN. Regression validation passed with 4/4 tests.
-This correction fixes the duplicate-number problem only. It does not permit combining INCLUDEOBJECTS and EXCLUDEOBJECTS; ZDM rejects that separate configuration with PRGT-1073. A migration must use either an include-only strategy or an exclusion-only strategy.
+This correction fixes the duplicate-number problem only. It does not permit combining INCLUDEOBJECTS and EXCLUDEOBJECTS; ZDM rejects that separate configuration with PRGT-1073. Migration Factory now rejects the mixed strategy before writing the response file. A migration must use either an include-only strategy or an exclusion-only strategy.
 
 ## 2026-08-10 - OEM REST Blackout Changelog - v1.15
 
