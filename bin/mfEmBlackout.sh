@@ -10,11 +10,12 @@
 #
 #  Functions           : 
 #                        - detailed_usage
+#                        - mf_parse_blackout_arguments
 #                        - usage
 #
 # *****************************************************************************
 
-VERSION=1.16
+VERSION=1.17
 # ************************************************************************** 
 # Modifications :
 # =============
@@ -38,6 +39,8 @@ VERSION=1.16
 #                  planned GO-LIVE start plus two hours.
 # 17/09/2026 AIN - Version 1.16, make REST START an idempotent ensure-on
 #                  operation and keep REST failures on the selected backend.
+# 17/09/2026 AIN - Version 1.17, reject incomplete or malformed option lists so
+#                  REST STATUS/STOP/IS_ON can never fall back to START.
 #
 # ************************************************************************** 
 SCRIPT_LIB="Migration Factory 2.0 : Manage EM blackouts for a target database"
@@ -87,11 +90,11 @@ detailed_usage()
   Main workflow
   =============
 
-    With -r, the OEM REST helper manages the canonical blackout name. START is
-    an ensure-on operation: it reuses any exact STARTED blackout or creates a
-    new one and succeeds only after exact STARTED coverage is verified. REST
-    failures never fall back to local emctl. Without -r, the legacy local emctl
-    workflow remains unchanged.
+    With -r, -A is mandatory and the OEM REST helper manages the canonical
+    blackout name. START is an ensure-on operation: it reuses any exact STARTED
+    blackout or creates a new one and succeeds only after exact STARTED coverage
+    is verified. REST failures never fall back to local emctl. Without -r, the
+    legacy local emctl workflow remains unchanged and START remains the default.
 
     -d supplies an explicit START duration. The local emctl default remains
     12:00. For REST START without -d, a future GO-LIVE ends at GO-LIVE + 2h, a
@@ -142,7 +145,8 @@ Required:
   -m MIGRATION_ID        : ID of the migration (base name for files).
 
 Options:
-  -A ACTION              : START (default), STOP, STATUS, or IS_ON.
+  -A ACTION              : START, STOP, STATUS, or IS_ON. Required with -r;
+                             without -r, START remains the default.
   -d DURATION            : Explicit START duration in [D] HH:MI format.
   -r                     : Use the centralized OEM REST API for the selected action.
                              Without -r, all actions retain local emctl behavior.
@@ -173,6 +177,86 @@ EOF
 
 
 _____________________________scriptSpecificFunctions() { : ; }
+
+mf_parse_blackout_arguments()
+{
+  local opt
+  local OPTIND=1
+
+  MF_MIGRATION_ID=
+  ACTION=
+  DURATION=12:00
+  DURATION_EXPLICIT=N
+  USE_REST_API=N
+
+  while getopts :m:A:d:rQVnh opt
+  do
+    case "$opt" in
+      A)
+        [[ "$OPTARG" != -* ]] \
+          || { die "Option -A requires an argument"; return 1; }
+        ACTION=${OPTARG^^}
+        ;;
+      d)
+        [[ "$OPTARG" != -* ]] \
+          || { die "Option -d requires an argument"; return 1; }
+        DURATION=${OPTARG^^}
+        DURATION_EXPLICIT=Y
+        ;;
+      r) USE_REST_API=Y ;;
+      Q) setVar LOG_QUIET Y ;;
+      V) setVar LOG_QUIET N ;;
+      m)
+        [[ "$OPTARG" != -* ]] \
+          || { die "Option -m requires an argument"; return 1; }
+        setVar MF_MIGRATION_ID "${OPTARG^^}"
+        ;;
+      n) logOutput=NO ;;
+      h) usage "Help requested" ;;
+      :)
+        die "Option -$OPTARG requires an argument"
+        return 1
+        ;;
+      \?)
+        if [ "${OPTARG:-}" = "?" ]
+        then
+          usage "Help requested"
+        fi
+        die "Unknown option: -${OPTARG:-}"
+        return 1
+        ;;
+    esac
+  done
+  shift "$((OPTIND - 1))"
+
+  if [ "$#" -ne 0 ]
+  then
+    die "Unexpected argument(s): $*"
+    return 1
+  fi
+  if [ -z "$ACTION" ]
+  then
+    if [ "$USE_REST_API" = Y ]
+    then
+      die "Action (-A) is mandatory with -r"
+      return 1
+    fi
+    # Preserve the legacy local-emctl default when -r is not selected.
+    ACTION=START
+  fi
+  case "$ACTION" in
+    START|STOP|STATUS|IS_ON) : ;;
+    *)
+      die "Action (-A) must be one of IS_ON,START,STOP or STATUS"
+      return 1
+      ;;
+  esac
+  if [ -z "$MF_MIGRATION_ID" ]
+  then
+    die "MIGRATION_ID (-m) is mandatory"
+    return 1
+  fi
+}
 
 # ******************************************************************************
 # ******************************************************************************
@@ -222,38 +306,8 @@ touch $TMPFILE
   #
   #       Anlyze script's parameters (don't forget to updatethe usage fonction
   #
-  MF_MIGRATION_ID=""                         # Mandatory to pass as argument
-  ACTION=START
-  DURATION="12:00"
-  DURATION_EXPLICIT=N
-  USE_REST_API=N
-  toShift=0
-  while getopts :m:A:d:rQVnh opt
-  do
-    case $opt in
-     # --------- Script parameters ---------------------------------------------
-     A) ACTION=${OPTARG^^}                            ; toShift=$(($toShift + 2)) ;;
-     d) DURATION=${OPTARG^^} ; DURATION_EXPLICIT=Y    ; toShift=$(($toShift + 2)) ;;
-     r) USE_REST_API=Y                                ; toShift=$(($toShift + 1)) ;;
-     # --------- Common parameters ---------------------------------------------
-     Q) setVar LOG_QUIET                  Y           ; toShift=$(($toShift + 1)) ;;
-     V) setVar LOG_QUIET                  N           ; toShift=$(($toShift + 1)) ;;
-     m) setVar MF_MIGRATION_ID            ${OPTARG^^} ; toShift=$(($toShift + 2)) ;;
-     # --------- Usage ---------------------------------------------------------
-     n)   logOutput=NO   ; toShift=$(($toShift + 1)) ;;
-     ?|h) usage "Help requested";;
-    esac
-  done
-  shift $toShift 
+  mf_parse_blackout_arguments "$@" || exit 1
   logOutput=NO
-  #
-  #   Control parameters
-  #
-  case $ACTION in
-    START|STOP|STATUS|IS_ON) : ;;
-    *) die "Action (-A) must be one of IS_ON,START,STOP or STATUS" ;;
-  esac
-  [ "$MF_MIGRATION_ID" = "" ] && die "MIGRATION_ID (-m) is mandatory"
   mfSetEnvFile
   [ "$MF_RUN_MIGRATION" = "N" ] && setVar MF_EVAL_FLAG "-eval"
   setVar MF_RSP_FILE $RSP_FILES/${MF_MIGRATION_ID}.rsp

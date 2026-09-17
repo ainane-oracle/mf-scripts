@@ -1,6 +1,6 @@
 # Migration Factory `bin` changelog
 
-## 2026-09-17 - OEM REST blackout ensure-on - helper v1.17 / entry point v1.16
+## 2026-09-17 - OEM REST blackout ensure-on - helper v1.17 / entry point v1.17
 
 ### Changed
 
@@ -29,6 +29,10 @@
   the command returns nonzero if any individual outcome remains unverified.
 - Selecting REST with `-r` no longer falls back to local `emctl` after a REST
   failure. Without `-r`, the local `emctl` path is unchanged.
+- REST mode now requires an explicit `-A`. The parser rejects unknown options,
+  missing option values, stray positional arguments, and non-ASCII option
+  dashes before any REST helper can run. Local mode still defaults to `START`
+  when `-A` is omitted.
 - Without an explicit `-d`, a past GO-LIVE date now means a fresh two-hour REST
   blackout; it does not reuse the expired planned end time.
 
