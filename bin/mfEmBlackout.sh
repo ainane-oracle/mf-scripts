@@ -14,7 +14,7 @@
 #
 # *****************************************************************************
 
-VERSION=1.15
+VERSION=1.16
 # ************************************************************************** 
 # Modifications :
 # =============
@@ -36,6 +36,8 @@ VERSION=1.15
 #                  terminal cleanup before canonical-name reuse.
 # 10/08/2026 AIN - Version 1.15, make a REST START without -d end at the
 #                  planned GO-LIVE start plus two hours.
+# 17/09/2026 AIN - Version 1.16, make REST START an idempotent ensure-on
+#                  operation and keep REST failures on the selected backend.
 #
 # ************************************************************************** 
 SCRIPT_LIB="Migration Factory 2.0 : Manage EM blackouts for a target database"
@@ -85,17 +87,16 @@ detailed_usage()
   Main workflow
   =============
 
-    With -r, the OEM REST helper manages one canonical blackout identity. For
-    START, STATUS, and IS_ON, a REST failure before any REST mutation can fall
-    back to local emctl. Once REST mutation was attempted, or a canonical REST
-    blackout cannot be verified safely, the script refuses a local fallback to
-    avoid duplicate or uncertain blackout state. STOP reports uncertain REST
-    outcomes as warnings and may continue without a local fallback.
+    With -r, the OEM REST helper manages the canonical blackout name. START is
+    an ensure-on operation: it reuses any exact STARTED blackout or creates a
+    new one and succeeds only after exact STARTED coverage is verified. REST
+    failures never fall back to local emctl. Without -r, the legacy local emctl
+    workflow remains unchanged.
 
     -d supplies an explicit START duration. The local emctl default remains
-    12:00. For REST START without -d, the code queries the planned GO-LIVE time
-    but currently replaces any nonempty computed value with 01:00 before calling
-    the REST helper; do not assume the advertised GO-LIVE-plus-two-hours duration.
+    12:00. For REST START without -d, a future GO-LIVE ends at GO-LIVE + 2h, a
+    GO-LIVE that has already passed creates a fresh 2h blackout, and a missing
+    or ambiguous GO-LIVE value falls back to 1h.
 
   Operational notes
   =================
@@ -159,7 +160,8 @@ Examples:
   $(basename "$0") -m MIGRATION_ID -r -A STATUS
 
 Notes:
-  START/STOP change OEM monitoring state. For REST START, pass -d explicitly.
+  START/STOP change OEM monitoring state. Omit -d to use the planned GO-LIVE
+  window for REST START; pass -d only to override that duration.
 
 Version:
   $VERSION
@@ -370,26 +372,15 @@ touch $TMPFILE
         REST_RC=$?
         case "$REST_RC" in
           0) : ;;
-          3) die "An exact canonical OEM REST blackout is duplicated, incomplete, or not safely restartable" ;;
-          *)
-            if [ "${MF_OEM_MUTATION_ATTEMPTED:-N}" = "Y" ]
-            then
-              die "Centralized OEM REST blackout outcome is uncertain or incomplete; local fallback is unsafe"
-            elif [ "${MF_OEM_EXACT_CANDIDATE_COUNT:-0}" -gt 0 ]
-            then
-              die "An exact canonical OEM REST blackout exists but could not be verified; local fallback is unsafe"
-            fi
-            mf_oem_warning "OEM REST START failed before create; falling back to local emctl"
-            USE_REST_API=N
-            ;;
+          3) die "OEM REST START could not prove an exact STARTED blackout" ;;
+          *) die "OEM REST START failed or remained unverified; no local fallback was attempted" ;;
         esac
         ;;
       STATUS)
         if ! mf_oem_status_blackout "$MF_MIGRATION_ID" "$MFAUTO_MIG_ID" "$CDB_NAME" \
              "$TARGETCONTAINERDATABASE_CONNECTIONDETAILS_SERVICENAME"
         then
-          mf_oem_warning "OEM REST STATUS workflow failed; falling back to local emctl"
-          USE_REST_API=N
+          die "OEM REST STATUS failed; no local fallback was attempted"
         fi
         ;;
       IS_ON)
@@ -399,7 +390,7 @@ touch $TMPFILE
         case "$REST_RC" in
           0) : ;;
           3) die "Canonical OEM REST blackout is not STARTED with complete discovered target coverage" ;;
-          *) mf_oem_warning "OEM REST IS_ON workflow failed; falling back to local emctl"; USE_REST_API=N ;;
+          *) die "OEM REST IS_ON could not be verified; no local fallback was attempted" ;;
         esac
         ;;
       STOP)
@@ -408,20 +399,9 @@ touch $TMPFILE
         REST_RC=$?
         case "$REST_RC" in
           0) : ;;
-          3) mf_oem_warning "OEM REST STOP could not identify one safe blackout; Migration Factory will continue" ;;
-          4) mf_oem_warning "The OEM REST blackout changed to a non-stoppable state; Migration Factory will continue" ;;
-          *)
-            if [ "${MF_OEM_MUTATION_ATTEMPTED:-N}" = "Y" ]
-            then
-              mf_oem_warning "OEM REST STOP outcome is uncertain or incomplete; Migration Factory will continue without emctl fallback"
-            elif [ "${MF_OEM_EXACT_CANDIDATE_COUNT:-0}" -gt 0 ]
-            then
-              mf_oem_warning "An OEM REST blackout could not be verified for STOP; Migration Factory will continue without emctl fallback"
-            else
-              mf_oem_warning "OEM REST STOP failed before mutation; falling back to local emctl"
-              USE_REST_API=N
-            fi
-            ;;
+          3) die "OEM REST STOP could not identify a safe complete result" ;;
+          4) die "The OEM REST blackout changed to a non-stoppable state" ;;
+          *) die "OEM REST STOP failed or remained uncertain; no local fallback was attempted" ;;
         esac
         ;;
     esac

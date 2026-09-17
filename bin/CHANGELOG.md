@@ -1,5 +1,44 @@
 # Migration Factory `bin` changelog
 
+## 2026-09-17 - OEM REST blackout ensure-on - helper v1.17 / entry point v1.16
+
+### Changed
+
+- `START` is now an ensure-on operation. It succeeds without mutation when at
+  least one same-name blackout is independently verified as `STARTED` with the
+  exact currently discovered target-ID set. Otherwise it creates a new
+  same-name blackout; `STOPPED`, `ENDED`, scheduled, transitional, failed,
+  partial, unknown, and coverage-mismatched records do not block that create.
+- A newly created blackout must reach `STARTED` and exact target coverage before
+  `START` reports success. A lost or unexpected create response is reconciled by
+  re-listing and re-verifying the same-name records; uncertainty remains an
+  error.
+- Before creation, a failed list/detail snapshot is retried as a complete unit.
+  Creation still requires one successful snapshot that proves no exact
+  `STARTED` candidate exists.
+- `IS_ON` uses the same existential rule: any independently verified exact
+  `STARTED` record means ON, even when lifecycle history or transitional records
+  also exist.
+- The obsolete target `PATCH`, terminal `DELETE`, and STOP_PENDING cleanup paths
+  were removed. Existing records are not altered or deleted by `START`.
+- `STOP` retries can proceed past a duplicate already in `STOP_PENDING` and stop
+  the remaining independently verified exact `STARTED` duplicates. Changed
+  coverage, failed, partial, and unknown states still fail closed.
+- A lost or unexpected STOP response is reconciled against the same immutable
+  blackout ID. Duplicate fan-out continues for the remaining verified IDs, and
+  the command returns nonzero if any individual outcome remains unverified.
+- Selecting REST with `-r` no longer falls back to local `emctl` after a REST
+  failure. Without `-r`, the local `emctl` path is unchanged.
+- Without an explicit `-d`, a past GO-LIVE date now means a fresh two-hour REST
+  blackout; it does not reuse the expired planned end time.
+
+### Caller boundary
+
+- `mfDbActions.sh`, `mfCreateTargetPDB.sh`, and `mfUpdateparams.sh` (stable and
+  unstable copies) already stop their workflow when REST `START` returns
+  nonzero. This preserves the required boundary: an unavailable OEM or an
+  unverified exact `STARTED` blackout cannot be reported as success.
+
 ## 2026-09-16 - `mfEmBlackout_oemRest.sh` - v1.16
 
 ### Changed
