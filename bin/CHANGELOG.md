@@ -1,5 +1,41 @@
 # Migration Factory `bin` changelog
 
+## 2026-09-17 - Time-qualified OEM blackout family - helper v1.18 / entry point v1.18
+
+### Changed
+
+- `MF_2_<CDB>_Migration` remains the preferred create name, but it is no longer
+  treated as a unique record. Migration Factory manages the exact base name and
+  names with the strict `_YYYYMMDDTHHMMSSZ` suffix. A timestamped name is tried
+  only when OEM explicitly rejects the base name as a duplicate/name-uniqueness
+  conflict; transport errors and uncertain responses are reconciled without a
+  second create under another name.
+- `START` and `IS_ON` now use the same contract. At least one individual
+  `STARTED` record must have the exact discovered target-ID set, include the
+  current time, and last through the requested end. Duplicate coverage is never
+  combined across OEM IDs.
+- Without `-d`, both actions require coverage through planned GO-LIVE plus two
+  hours when GO-LIVE is uniquely defined and still in the future. Missing,
+  ambiguous, current, or past GO-LIVE falls back to two hours from now. An
+  explicit `-d` overrides this rule for both actions.
+- `STOPPED` and `ENDED` records are historical: they remain visible in `STATUS`
+  but never block `START` and are never deleted. `STATUS` lists every managed
+  record with its immutable ID, name, status, start, and end.
+- When only inadequate `STARTED` records exist, `START` first creates and
+  verifies replacement coverage, then best-effort stops the old records.
+  Transitional, failed, partial, unknown, or unverifiable records still fail
+  closed and do not permit a competing create.
+- `STOP` processes every managed-family ID. It requests stop for every
+  `STARTED` record regardless of current target coverage, treats
+  `STOP_PENDING`/`STOPPED`/`ENDED` as idempotent no-ops, continues after an
+  individual failure, treats an ID concurrently removed from OEM as already
+  stopped, and returns nonzero when any result remains unverified.
+- The stable and unstable callers run `START` only when `IS_ON` returns the
+  definitive not-covered code `3`. Other `IS_ON` failures remain fatal. The
+  30-minute callers pass the same `-d 00:30` to both checks; the target-PDB flow
+  uses the shared GO-LIVE/default duration rule.
+- The local `emctl` workflow is unchanged when `-r` is not supplied.
+
 ## 2026-09-17 - OEM REST blackout ensure-on - helper v1.17 / entry point v1.17
 
 ### Changed

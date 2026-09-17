@@ -657,8 +657,12 @@ _SQL_
     # fi
 
     libAction "Testing if database is under blackout" "$I1"
-    if ! $MF_BIN/mfEmBlackout.sh -m $MF_MIGRATION_ID -r -A IS_ON -n </dev/null >/dev/null 2>&1
+    if $MF_BIN/mfEmBlackout.sh -m $MF_MIGRATION_ID -r -A IS_ON -d "00:30" -n </dev/null >/dev/null 2>&1
     then
+      echo "Active blackout"
+    else
+      BLACKOUT_RC=$?
+      [ "$BLACKOUT_RC" -eq 3 ] || die "Unable to verify the OEM blackout"
       echo "No Blackout"
       libAction "Start Blackout (00:30), until : $(date -d "now + 30 minutes")"  "$I2"
       if $MF_BIN/mfEmBlackout.sh -m $MF_MIGRATION_ID -r -A START -d "00:30" -n </dev/null >/dev/null 2>&1
@@ -668,9 +672,6 @@ _SQL_
         echo Error
         die "Unable to create blackout"
       fi
-      # $MF_BIN/mfEmBlackout.sh -m $MF_MIGRATION_ID -r -A IS_ON -n </dev/null >/dev/null 2>&1 || die "Blackout not active (error creating it)"
-    else
-      echo "Active blackout"
     fi
     mfDatabasesInfos
     databaseHost=$primSSH

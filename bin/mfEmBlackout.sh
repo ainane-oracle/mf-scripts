@@ -15,7 +15,7 @@
 #
 # *****************************************************************************
 
-VERSION=1.17
+VERSION=1.18
 # ************************************************************************** 
 # Modifications :
 # =============
@@ -41,6 +41,8 @@ VERSION=1.17
 #                  operation and keep REST failures on the selected backend.
 # 17/09/2026 AIN - Version 1.17, reject incomplete or malformed option lists so
 #                  REST STATUS/STOP/IS_ON can never fall back to START.
+# 17/09/2026 AIN - Version 1.18, make REST START and IS_ON verify the same
+#                  target and duration window across duplicate blackout IDs.
 #
 # ************************************************************************** 
 SCRIPT_LIB="Migration Factory 2.0 : Manage EM blackouts for a target database"
@@ -90,16 +92,16 @@ detailed_usage()
   Main workflow
   =============
 
-    With -r, -A is mandatory and the OEM REST helper manages the canonical
-    blackout name. START is an ensure-on operation: it reuses any exact STARTED
-    blackout or creates a new one and succeeds only after exact STARTED coverage
-    is verified. REST failures never fall back to local emctl. Without -r, the
-    legacy local emctl workflow remains unchanged and START remains the default.
+    With -r, -A is mandatory and the OEM REST helper manages the
+    MF_2_<CDB>_Migration name family. START and IS_ON require one independently
+    verified STARTED blackout to cover the exact target set from now through the
+    requested end. Historical STOPPED and ENDED records do not block a new
+    create. REST failures never fall back to local emctl. Without -r, the legacy
+    local emctl workflow remains unchanged and START remains the default.
 
-    -d supplies an explicit START duration. The local emctl default remains
-    12:00. For REST START without -d, a future GO-LIVE ends at GO-LIVE + 2h, a
-    GO-LIVE that has already passed creates a fresh 2h blackout, and a missing
-    or ambiguous GO-LIVE value falls back to 1h.
+    -d supplies the required START or IS_ON duration. The local emctl default
+    remains 12:00. For REST START or IS_ON without -d, a future GO-LIVE ends at
+    GO-LIVE + 2h. A missing, ambiguous, current, or past GO-LIVE uses 2h.
 
   Operational notes
   =================
@@ -147,7 +149,7 @@ Required:
 Options:
   -A ACTION              : START, STOP, STATUS, or IS_ON. Required with -r;
                              without -r, START remains the default.
-  -d DURATION            : Explicit START duration in [D] HH:MI format.
+  -d DURATION            : Required START/IS_ON duration in [D] HH:MI format.
   -r                     : Use the centralized OEM REST API for the selected action.
                              Without -r, all actions retain local emctl behavior.
   -Q                     : Quiet mode (remove progress output).
@@ -161,11 +163,12 @@ Examples:
   $(basename "$0") -m MIGRATION_ID -A START -d 02:00
   $(basename "$0") -m MIGRATION_ID -r -A START
   $(basename "$0") -m MIGRATION_ID -r -A START -d 02:00
+  $(basename "$0") -m MIGRATION_ID -r -A IS_ON -d 00:30
   $(basename "$0") -m MIGRATION_ID -r -A STATUS
 
 Notes:
   START/STOP change OEM monitoring state. Omit -d to use the planned GO-LIVE
-  window for REST START; pass -d only to override that duration.
+  rule for REST START/IS_ON; pass -d to require a specific coverage window.
 
 Version:
   $VERSION
@@ -251,6 +254,14 @@ mf_parse_blackout_arguments()
       return 1
       ;;
   esac
+  if [ "$USE_REST_API" = "Y" ] \
+     && [ "$DURATION_EXPLICIT" = "Y" ] \
+     && [ "$ACTION" != "START" ] \
+     && [ "$ACTION" != "IS_ON" ]
+  then
+    die "Option -d is valid only with START or IS_ON"
+    return 1
+  fi
   if [ -z "$MF_MIGRATION_ID" ]
   then
     die "MIGRATION_ID (-m) is mandatory"
@@ -387,29 +398,37 @@ touch $TMPFILE
   infoAction "    Database              : $CDB_NAME" "$I1"
   infoAction "    Database unique name  : $CDB_UNIQUE_NAME" "$I1"
 
-  # A REST START without an explicit -d follows the planned migration window.
-  # Keep -d authoritative for shorter maintenance actions such as a rolling
-  # restart, and keep the legacy local-emctl default unchanged.
-  if [ "$USE_REST_API" = "Y" ] && [ "$ACTION" = "START" ] && [ "$DURATION_EXPLICIT" != "Y" ]
+  # REST START and IS_ON must evaluate the same requested window. Keep -d
+  # authoritative and leave the legacy local-emctl default unchanged.
+  if [ "$USE_REST_API" = "Y" ] \
+     && { [ "$ACTION" = "START" ] || [ "$ACTION" = "IS_ON" ]; } \
+     && [ "$DURATION_EXPLICIT" != "Y" ]
   then
     DURATION=$(exec_sql "$MF_REPO_CONNECT" "
       select case
-        when count(*) != 1 then null
-        when min(target_date) <= sysdate then '02:00'
+        when row_count != 1 or go_live <= sysdate then '02:00'
         else
           case
-            when (min(target_date) + interval '2' hour - sysdate) < 1 then ''
-            else to_char(trunc(min(target_date) + interval '2' hour - sysdate)) || ' '
+            when total_minutes < 1440 then ''
+            else to_char(trunc(total_minutes / 1440)) || ' '
           end ||
-          to_char(trunc(mod((min(target_date) + interval '2' hour - sysdate) * 24, 24)), 'FM00') || ':' ||
-          to_char(trunc(mod((min(target_date) + interval '2' hour - sysdate) * 24 * 60, 60)), 'FM00')
+          to_char(trunc(mod(total_minutes, 1440) / 60), 'FM00') || ':' ||
+          to_char(mod(total_minutes, 60), 'FM00')
       end
-      from migration_planned_operations po
-      where po.mig_id = '$MFAUTO_MIG_ID'
-        and po.mls_id = mf_mig_parameters.get_id('MLS_ID_GOLIVE_START', po.prj_name)
-        and po.current_plan = 'Y';")
-    [ "$DURATION" = "" ] && DURATION='01:00'
-    infoAction "    REST duration         : $DURATION (planned GO-LIVE + 2 hours)" "$I1"
+      from (
+        select row_count,
+               go_live,
+               ceil((go_live + 2/24 - sysdate) * 1440) total_minutes
+        from (
+          select count(*) row_count, min(target_date) go_live
+          from migration_planned_operations po
+          where po.mig_id = '$MFAUTO_MIG_ID'
+            and po.mls_id = mf_mig_parameters.get_id('MLS_ID_GOLIVE_START', po.prj_name)
+            and po.current_plan = 'Y'
+        )
+      );")
+    [ "$DURATION" = "" ] && DURATION='02:00'
+    infoAction "    REST required window  : $DURATION (GO-LIVE + 2h before GO-LIVE; otherwise 2h)" "$I1"
   fi
   EMCTL=/u02/app/oracle/oem/agent/agent_inst/bin/emctl
   startStep "$ACTION a blackout for a database ($CDB_NAME)"
@@ -439,11 +458,15 @@ touch $TMPFILE
         ;;
       IS_ON)
         mf_oem_is_blackout_on "$MF_MIGRATION_ID" "$MFAUTO_MIG_ID" "$CDB_NAME" \
-          "$TARGETCONTAINERDATABASE_CONNECTIONDETAILS_SERVICENAME"
+          "$TARGETCONTAINERDATABASE_CONNECTIONDETAILS_SERVICENAME" "$DURATION"
         REST_RC=$?
         case "$REST_RC" in
           0) : ;;
-          3) die "Canonical OEM REST blackout is not STARTED with complete discovered target coverage" ;;
+          3)
+            mf_oem_cleanup
+            trap - EXIT
+            exit 3
+            ;;
           *) die "OEM REST IS_ON could not be verified; no local fallback was attempted" ;;
         esac
         ;;
